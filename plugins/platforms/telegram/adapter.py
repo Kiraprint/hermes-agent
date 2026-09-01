@@ -4431,6 +4431,48 @@ class TelegramAdapter(BasePlatformAdapter):
             },
         }
 
+    async def _handle_application_error(self, update: object, context) -> None:
+        """Handle uncaught exceptions from PTB handlers.
+
+        Registered via app.add_error_handler() to catch exceptions that escape
+        individual message/callback handlers. Logs benign edge cases (stale
+        inline keyboard interactions) at DEBUG level to reduce log noise, while
+        preserving WARNING-level visibility for unexpected errors.
+
+        Common benign cases:
+        - BadRequest "Message is not modified": user clicked an inline button
+          that would produce the same message text/markup (no-op edit)
+        - BadRequest "Query is too old": user clicked a stale inline keyboard
+          after a bot restart or >48h delay
+
+        These are expected Telegram API behavior, not application bugs.
+        """
+        error = context.error
+        safe_error = _redact_telegram_error_text(error)
+        
+        # Detect benign BadRequest patterns
+        is_benign = False
+        try:
+            from telegram.error import BadRequest
+            if isinstance(error, BadRequest):
+                error_msg = str(error).lower()
+                if "message is not modified" in error_msg or "query is too old" in error_msg:
+                    is_benign = True
+        except ImportError:
+            pass
+        
+        if is_benign:
+            logger.debug(
+                "[%s] Benign Telegram API edge case: %s",
+                self.name, safe_error
+            )
+        else:
+            logger.warning(
+                "[%s] Unhandled error in Telegram handler: %s",
+                self.name, safe_error,
+                exc_info=True
+            )
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app``.
 
@@ -4466,6 +4508,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # gateway_platform_event observer (see _on_platform_update); group 99 so
         # it observes alongside, never displaces, the core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
+        # Error handler to catch uncaught exceptions from all handlers above,
+        # preventing PTB from logging "No error handlers are registered" warnings
+        app.add_error_handler(self._handle_application_error)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
