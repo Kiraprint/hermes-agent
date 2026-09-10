@@ -4873,6 +4873,57 @@ def _retry_status_for_run(
     return "review" if payload.get("source_status") == "review" else "ready"
 
 
+def _crash_recovery_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    retry_status: str,
+) -> "tuple[str, Optional[str]]":
+    """Crash-requeue review-handoff recovery (mechanism A, incident t_91c7c52f).
+
+    When a crashed/timed-out implementation run is requeued to ``ready`` but a
+    GitHub PR URL was posted in a task comment within
+    ``_RESPAWN_GUARD_PR_WINDOW``, the READY-lane ``active_pr`` respawn guard
+    then parks the card for up to 24h even though the work is done and only
+    the terminal handoff was skipped (worker crash, rc=0 protocol violation,
+    pid-not-alive). The canonical next step for a task with a fresh PR is the
+    REVIEW lane, which already skips ``active_pr``/``recent_success``
+    (see ``check_respawn_guard``) — so we route the requeue straight there
+    instead of weakening the guards themselves.
+
+    Deliberately narrow (factory-lead decision, board task t_0e1b206d):
+
+    * only ``ready``-bound retries are redirected — a run whose source phase
+      was already ``review`` resumes there anyway;
+    * a PR comment older than ``_RESPAWN_GUARD_PR_WINDOW`` does NOT trigger
+      recovery (the PR is stale — normal guarded requeue);
+    * no PR comment at all → behaviour is exactly as before;
+    * kill switch: ``KANBAN_CRASH_REVIEW_RECOVERY=0`` restores the previous
+      behaviour without a deploy.
+
+    Returns ``(status, pr_url)`` — ``pr_url`` is the matched URL (from the
+    LATEST matching comment) or ``None`` when recovery did not fire.
+    """
+    if retry_status != "ready":
+        return retry_status, None
+    if os.environ.get("KANBAN_CRASH_REVIEW_RECOVERY", "1").strip().lower() in {
+        "0", "false", "off", "no",
+    }:
+        return retry_status, None
+    now = int(time.time())
+    cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    comments = conn.execute(
+        "SELECT body FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? "
+        "ORDER BY created_at DESC, id DESC",
+        (task_id, cutoff),
+    ).fetchall()
+    for c in comments:
+        match = _RESPAWN_GUARD_PR_URL_RE.search(c["body"] or "")
+        if match:
+            return "review", match.group(0)
+    return retry_status, None
+
+
 def goal_run_status(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5063,12 +5114,19 @@ def release_stale_claims(
             continue
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, row["id"])
+            # Crash-requeue review-handoff recovery (mechanism A, t_91c7c52f):
+            # same redirect as in detect_crashed_workers — a stale claim on a
+            # task with a fresh PR comment resumes into the review lane rather
+            # than parking in ready under the active_pr guard.
+            recovery_status, recovery_pr_url = _crash_recovery_status(
+                conn, row["id"], retry_status,
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                (recovery_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -5094,6 +5152,13 @@ def release_stale_claims(
                 "heartbeat_stale": bool(heartbeat_stale),
                 "retry_status": retry_status,
             }
+            if recovery_pr_url:
+                payload["crash_review_recovery"] = {
+                    "auto": True,
+                    "pr_url": recovery_pr_url,
+                    "from": "ready",
+                    "to": recovery_status,
+                }
             payload.update(termination)
             _append_event(
                 conn, row["id"], "reclaimed",
@@ -8989,13 +9054,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             retry_status = _retry_status_for_run(conn, row["id"])
+            # Crash-requeue review-handoff recovery (mechanism A, t_91c7c52f):
+            # a crashed run whose task carries a fresh PR comment goes to the
+            # review lane instead of sitting in ready under the active_pr
+            # guard. See _crash_recovery_status for scope and kill switch.
+            recovery_status, recovery_pr_url = _crash_recovery_status(
+                conn, row["id"], retry_status,
+            )
             event_payload["retry_status"] = retry_status
+            if recovery_pr_url:
+                event_payload["crash_review_recovery"] = {
+                    "auto": True,
+                    "pr_url": recovery_pr_url,
+                    "from": "ready",
+                    "to": recovery_status,
+                }
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (recovery_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
