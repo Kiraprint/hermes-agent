@@ -2326,12 +2326,19 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
             continue
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, row["id"])
+            # Crash-requeue review-handoff recovery (mechanism A, t_91c7c52f):
+            # same redirect as in detect_crashed_workers — a stale claim on a
+            # task with a fresh PR comment resumes into the review lane rather
+            # than parking in ready under the active_pr guard.
+            recovery_status, recovery_pr_url = _crash_recovery_status(
+                conn, row["id"], retry_status,
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                (recovery_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -2347,6 +2354,14 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
                     "retry_status": retry_status,
+                    **({
+                        "crash_review_recovery": {
+                            "auto": True,
+                            "pr_url": recovery_pr_url,
+                            "from": "ready",
+                            "to": recovery_status,
+                        }
+                    } if recovery_pr_url else {}),
                 },
             )
             reclaimed += 1
@@ -4043,6 +4058,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
+    _crash_recovery_status,
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _terminate_reclaimed_worker,
