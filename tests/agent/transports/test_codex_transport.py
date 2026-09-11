@@ -1340,6 +1340,18 @@ class TestCodexValidateResponse:
         r = SimpleNamespace(output=[{"type": "message", "content": []}])
         assert transport.validate_response(r) is True
 
+    @pytest.mark.parametrize("status", ["failed", "cancelled"])
+    def test_terminal_failure_status_invalid_despite_output(self, transport, status):
+        """Regression (t_4477a2a4): a terminal failed/cancelled response carrying
+        partial output must be invalid so it routes to retry/fallback inside the
+        inner loop instead of raising in normalization as an outer-loop error."""
+        r = SimpleNamespace(
+            status=status,
+            output=[SimpleNamespace(type="message")],
+            error=SimpleNamespace(code="server_error", message="The model failed to generate a response."),
+        )
+        assert transport.validate_response(r) is False
+
 
 
 
