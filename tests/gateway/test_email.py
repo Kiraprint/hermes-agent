@@ -725,6 +725,76 @@ class TestPollLoop(unittest.TestCase):
         self.assertIn(b"2", adapter._seen_uids)
         self.assertFalse(adapter._last_fetch_failed)
 
+    def test_retry_heals_transient_failure_without_escalation(self):
+        """Two transient IMAP failures then success: no escalation, circuit stays closed."""
+        adapter = self._make_adapter()
+        adapter._retry_base = 0  # no sleeping in tests
+        attempts = []
+
+        good_email = MIMEText("Body", "plain", "utf-8")
+        good_email["From"] = "sender@test.com"
+        good_email["Subject"] = "healed"
+        good_email["Message-ID"] = "<healed@test.com>"
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                attempts.append(args)
+                if len(attempts) < 3:
+                    raise TimeoutError("read operation timed out")
+                return ("OK", [(b"1", good_email.as_bytes())])
+            return ("NO", [])
+
+        mock_imap = MagicMock()
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            results = adapter._fetch_new_messages()
+
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["subject"], "healed")
+        self.assertFalse(adapter._last_fetch_failed)
+        self.assertEqual(adapter.circuit_state, "closed")
+
+    def test_retry_exhaustion_escalates_and_counts_circuit_failure_once(self):
+        """Persistent failure: attempts stop at the max, one circuit-breaker count, escalated."""
+        adapter = self._make_adapter()
+        adapter._retry_base = 0
+        attempts = []
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                attempts.append(args)
+                raise OSError("connection dropped")
+            return ("NO", [])
+
+        mock_imap = MagicMock()
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            results = adapter._fetch_new_messages()
+
+        self.assertEqual(len(attempts), adapter._retry_max)
+        self.assertEqual(results, [])
+        self.assertTrue(adapter._last_fetch_failed)
+        self.assertEqual(adapter._cb_consecutive_failures, 1)  # one failed poll, not N attempts
+
+    def test_retry_skipped_when_circuit_open(self):
+        """Open circuit: the wrapper returns failure without invoking the IMAP op."""
+        adapter = self._make_adapter()
+        adapter._retry_base = 0
+        import time as _time
+        adapter._cb_opened_at = _time.monotonic()  # freshly opened: backoff not elapsed
+
+        with patch.object(adapter, "_inbox", side_effect=AssertionError("must not connect")):
+            results = adapter._fetch_new_messages()
+
+        self.assertEqual(results, [])
+        self.assertEqual(adapter.circuit_state, "open")
+        self.assertFalse(adapter._last_fetch_failed)  # a skip is not a new failure
+
 
 class TestReconnectSeenUidsRestore(unittest.TestCase):
     """connect(is_reconnect=True) must not re-mark the whole mailbox seen."""
@@ -911,7 +981,8 @@ class TestImapConnectionCleanup(unittest.TestCase):
             results = adapter._fetch_new_messages()
 
         self.assertEqual(results, [])
-        mock_imap.logout.assert_called_once()
+        # One logout per attempt: the retry wrapper reconnects on each transient failure.
+        self.assertEqual(mock_imap.logout.call_count, adapter._retry_max)
 
 
 class TestImapIdExtensionForNetEase(unittest.TestCase):

@@ -7,6 +7,7 @@ from contextlib import contextmanager, suppress
 import imaplib
 import logging
 import os
+import random
 import re
 import smtplib
 import socket
@@ -127,6 +128,10 @@ class _IPv4SMTP(smtplib.SMTP):
 class _IPv4SMTP_SSL(smtplib.SMTP_SSL):
     def _get_socket(self, host, port, timeout):  # type: ignore[override]
         return self.context.wrap_socket(_create_ipv4_connection(host, port, timeout, source_address=self.source_address), server_hostname=getattr(self, "_host", host))
+
+
+class _CircuitOpen(Exception):
+    """Internal: retry wrapper short-circuits when the breaker is open (not an IMAP failure)."""
 
 
 def _open_smtp(host: str, port: int, security: str, ctx: ssl.SSLContext, smtp_cls: type, smtp_ssl_cls: type, **kwargs: Any) -> smtplib.SMTP:
@@ -371,6 +376,9 @@ class EmailAdapter(BasePlatformAdapter):
         self._cb_backoff = max(1, _esecret_int("EMAIL_CB_BACKOFF_SECONDS", 300))
         self._cb_consecutive_failures = 0
         self._cb_opened_at: Optional[float] = None  # monotonic() timestamp; None == closed
+        # Retry wrapper: transient IMAP fetch failures retry with exponential backoff+jitter.
+        self._retry_max = max(1, _esecret_int("EMAIL_IMAP_RETRY_MAX", 3))
+        self._retry_base = max(0.0, float(_esecret_int("EMAIL_IMAP_RETRY_BASE_MS", 500)) / 1000)
         # chat_id (sender email) -> last subject + message-id for threading
         # Track the last IMAP fetch attempt so the poll loop can distinguish "checked, nothing new" from
         # "the check itself failed" (#80016).
@@ -567,41 +575,35 @@ class EmailAdapter(BasePlatformAdapter):
             self._set_fatal_error("email_imap_fetch_failed", self._last_fetch_error or "IMAP fetch failed", retryable=True)
             await self._notify_fatal_error()
 
+    def _with_imap_retry(self, op, op_name: str):
+        """Run one IMAP *op* with exp-backoff+jitter retries; open circuit fails fast, no loop."""
+        if not self._cb_poll_allowed():
+            logger.warning("[Email] IMAP %s skipped: circuit breaker OPEN (state=%s)", op_name, self.circuit_state)
+            raise _CircuitOpen(op_name)
+        attempt = 0
+        while True:
+            try:
+                return op()
+            except _CircuitOpen:
+                raise
+            except Exception as e:
+                attempt += 1
+                if attempt >= self._retry_max:
+                    raise
+                logger.warning("[Email] IMAP %s failed (attempt %d/%d), retrying: %s",
+                               op_name, attempt, self._retry_max, e)
+                time.sleep(self._retry_base * (2 ** (attempt - 1)) + random.uniform(0, self._retry_base))
+
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
-        results = []
+        results: List[Dict[str, Any]] = []
         try:
-            with self._inbox() as imap:
-                status, data = imap.uid("search", None, "UNSEEN")
-                for uid in (data[0].split() if status == "OK" and data and data[0] else []):
-                    if uid in self._seen_uids:
-                        continue
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
-                    if status != "OK":
-                        continue  # transient per-UID refusal: leave unseen so the next poll retries
-                    # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
-                    # but NOT before the fetch: a connection failure must leave the rest of the batch eligible for the next poll.
-                    # IMAP fetch can return unexpected structures (e.g. a single bytes item instead of a
-                    # list of tuples). See #80032.
-                    self._seen_uids.add(uid)
-                    self._trim_seen_uids()
-                    try:
-                        raw_email = msg_data[0][1]
-                    except (IndexError, TypeError):
-                        logger.warning("[Email] Unexpected IMAP response structure for UID %s, skipping", uid)
-                        continue
-                    if not isinstance(raw_email, (bytes, bytearray)):
-                        logger.warning("[Email] Non-bytes IMAP payload for UID %s, skipping", uid)
-                        continue
-                    # One poison message (unparseable headers, pathological attachment, DNS hiccup) must not abort the batch or force a reconnect.
-                    try:
-                        # See #80032.
-                        parsed = self._parse_fetched_message(uid, raw_email)
-                    except Exception as parse_exc:
-                        logger.error("[Email] Failed to process message UID %s, skipping: %s", uid, parse_exc)
-                        continue
-                    if parsed is not None:
-                        results.append(parsed)
+            # The batch list is shared across attempts: a retry re-searches UNSEEN and skips
+            # already-seen UIDs, so messages fetched before a mid-batch failure are kept and
+            # dispatched, never dropped (#80032).
+            self._with_imap_retry(lambda: self._fetch_batch(results), "fetch")  # noqa: E731
+        except _CircuitOpen:
+            return results
         except Exception as e:
             # _close_imap guarantees the socket dies even when logout() raises IMAP4.abort on a broken
             # connection (#79889).
@@ -612,6 +614,42 @@ class EmailAdapter(BasePlatformAdapter):
             self._cb_record_success()
         # Keep the reconnect snapshot current so a mid-outage adapter recreation does not re-dispatch messages already processed.
         self._seen_uids_snapshot[self._address] = set(self._seen_uids)
+        return results
+
+    def _fetch_batch(self, results: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """One search+fetch round-trip over UNSEEN (single attempt; raises on connection failure)."""
+        results = results if results is not None else []
+        with self._inbox() as imap:
+            status, data = imap.uid("search", None, "UNSEEN")
+            for uid in (data[0].split() if status == "OK" and data and data[0] else []):
+                if uid in self._seen_uids:
+                    continue
+                status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                if status != "OK":
+                    continue  # transient per-UID refusal: leave unseen so the next poll retries
+                # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
+                # but NOT before the fetch: a connection failure must leave the rest of the batch eligible for the next poll.
+                # IMAP fetch can return unexpected structures (e.g. a single bytes item instead of a
+                # list of tuples). See #80032.
+                self._seen_uids.add(uid)
+                self._trim_seen_uids()
+                try:
+                    raw_email = msg_data[0][1]
+                except (IndexError, TypeError):
+                    logger.warning("[Email] Unexpected IMAP response structure for UID %s, skipping", uid)
+                    continue
+                if not isinstance(raw_email, (bytes, bytearray)):
+                    logger.warning("[Email] Non-bytes IMAP payload for UID %s, skipping", uid)
+                    continue
+                # One poison message (unparseable headers, pathological attachment, DNS hiccup) must not abort the batch or force a reconnect.
+                try:
+                    # See #80032.
+                    parsed = self._parse_fetched_message(uid, raw_email)
+                except Exception as parse_exc:
+                    logger.error("[Email] Failed to process message UID %s, skipping: %s", uid, parse_exc)
+                    continue
+                if parsed is not None:
+                    results.append(parsed)
         return results
 
     def _parse_fetched_message(self, uid: bytes, raw_email: "bytes | bytearray") -> Optional[Dict[str, Any]]:
