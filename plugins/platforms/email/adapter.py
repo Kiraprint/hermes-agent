@@ -11,6 +11,7 @@ import re
 import smtplib
 import socket
 import ssl
+import time
 import uuid
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
@@ -364,6 +365,12 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
         self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
+        # Circuit breaker: consecutive IMAP/SMTP failures open the circuit, disabling further
+        # polls until a backoff elapses (half-open trial). Env-tunable; int parsing via _esecret_int.
+        self._cb_threshold = max(1, _esecret_int("EMAIL_CB_FAILURE_THRESHOLD", 3))
+        self._cb_backoff = max(1, _esecret_int("EMAIL_CB_BACKOFF_SECONDS", 300))
+        self._cb_consecutive_failures = 0
+        self._cb_opened_at: Optional[float] = None  # monotonic() timestamp; None == closed
         # chat_id (sender email) -> last subject + message-id for threading
         # Track the last IMAP fetch attempt so the poll loop can distinguish "checked, nothing new" from
         # "the check itself failed" (#80016).
@@ -380,6 +387,37 @@ class EmailAdapter(BasePlatformAdapter):
             logger.debug("[Email] Trimmed seen UIDs to %d entries", len(self._seen_uids))
         except (ValueError, TypeError):
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    @property
+    def circuit_state(self) -> str:
+        """Breaker metric value: ``"open"`` while polls are disabled, else ``"closed"``."""
+        return "open" if self._cb_opened_at is not None else "closed"
+
+    def _cb_record_success(self) -> None:
+        """A clean IMAP round-trip resets the count; a half-open trial that succeeds closes the circuit."""
+        self._cb_consecutive_failures = 0
+        if self._cb_opened_at is not None:
+            self._cb_opened_at = None
+            logger.warning("[Email] Circuit breaker recovered (closed): IMAP poll succeeded")
+
+    def _cb_record_failure(self, detail: str) -> None:
+        """Count one consecutive IMAP/SMTP failure; open the circuit once the threshold is hit."""
+        self._cb_consecutive_failures += 1
+        if self._cb_opened_at is None and self._cb_consecutive_failures >= self._cb_threshold:
+            self._cb_opened_at = time.monotonic()
+            logger.error("[Email] Circuit breaker OPEN after %d consecutive failures (%s): "
+                         "disabling polls for %ds", self._cb_consecutive_failures, detail, self._cb_backoff)
+        elif self._cb_opened_at is not None:
+            self._cb_opened_at = time.monotonic()  # failed half-open trial: slide the backoff window
+
+    def _cb_poll_allowed(self) -> bool:
+        """False while the circuit is open and the backoff has not elapsed (caller skips the IMAP call)."""
+        if self._cb_opened_at is None:
+            return True
+        if time.monotonic() - self._cb_opened_at >= self._cb_backoff:
+            logger.warning("[Email] Circuit breaker half-open: backoff elapsed, attempting recovery poll")
+            return True
+        return False
 
     def _connect_imap(self) -> imaplib.IMAP4:
         """Create an IMAP connection using implicit TLS, STARTTLS, or plaintext."""
@@ -426,6 +464,7 @@ class EmailAdapter(BasePlatformAdapter):
     def _fail(self, log_fmt: str, err: object, code: str, detail: str, *, retryable: bool) -> bool:
         """Log *err*, record a fatal error for the gateway's reconnect machinery, return False."""
         logger.error(log_fmt, err)
+        self._cb_record_failure(detail)  # ponytail: auth/config fatals also count; split counters when t_0ce02d0f retry wrapper needs the distinction
         self._set_fatal_error(code, detail, retryable=retryable)
         return False
 
@@ -512,6 +551,9 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def _check_inbox(self) -> None:
         """Check INBOX for unseen messages and dispatch them."""
+        if not self._cb_poll_allowed():
+            logger.warning("[Email] Circuit breaker OPEN - skipping IMAP poll (state=%s)", self.circuit_state)
+            return
         messages = await asyncio.get_running_loop().run_in_executor(None, self._fetch_new_messages)
         # Dispatch partial results BEFORE escalating a failure — a mid-batch exception returns what was fetched (already marked seen).
         for msg_data in messages:
@@ -565,6 +607,9 @@ class EmailAdapter(BasePlatformAdapter):
             # connection (#79889).
             logger.error("[Email] IMAP fetch error: %s", e)
             self._last_fetch_failed, self._last_fetch_error = True, str(e)
+            self._cb_record_failure(str(e))
+        else:
+            self._cb_record_success()
         # Keep the reconnect snapshot current so a mid-outage adapter recreation does not re-dispatch messages already processed.
         self._seen_uids_snapshot[self._address] = set(self._seen_uids)
         return results
