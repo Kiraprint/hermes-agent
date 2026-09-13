@@ -721,10 +721,15 @@ class ResponsesApiTransport(ProviderTransport):
         """
         if response is None:
             return False
+        # Terminal failed/cancelled statuses are invalid regardless of output:
+        # normalization raises on them, so they must route to the retry/fallback
+        # path (validate_response_shape) instead of escaping to the outer loop.
+        status = str(getattr(response, "status", "") or "").strip().lower()
+        if status in {"failed", "cancelled"}:
+            return False
         output = getattr(response, "output", None)
         if isinstance(output, list) and output:
             return True
-        status = str(getattr(response, "status", "") or "").strip().lower()
         details = getattr(response, "incomplete_details", None)
         raw_reason = details.get("reason") if isinstance(details, dict) else getattr(details, "reason", "")
         return status == "incomplete" and str(raw_reason or "").strip().lower() == "content_filter"
