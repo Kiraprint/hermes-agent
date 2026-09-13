@@ -37,6 +37,13 @@ _REASONING_STALE_TIMEOUT_FLOORS: dict[int, tuple[str, ...]] = {
         # "Ox Alpha" stealth reasoning model (OpenRouter / OpenCode Zen slugs); Thinking
         # Machines Inkling (covers inkling-small and :free SKUs).
         "ox-alpha", "x-preview-f-free", "inkling",
+        # Qwen3.8 generation — reasoning Qwen3.8 models (qwen3.8-27b, qwen3.8-27b-nvfp4)
+        # on local vLLM: a non-streaming call can need 3-5+ minutes to first byte
+        # (ctlab-doom-run-monitor 180s "no response" timeouts, incident t_3a513c34),
+        # past the 180s qwen3 family floor.  Longest-slug match means only
+        # qwen3.8* models get the 300s floor; plain qwen3 instruct/thinking variants
+        # keep the 180s floor.
+        "qwen3.8",
     ),
     # Anthropic Claude 4.x+ thinking variants (anchored so 3.x never matches).
     240: ("claude-opus-4", "claude-opus-5"),

@@ -2207,6 +2207,48 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
+def _is_transient_api_timeout_error(error: Optional[str]) -> bool:
+    """True when *error* is a transient LLM API / watchdog timeout, not a hard break.
+
+    A slow or queueing provider (shared near-full local vLLM engine, OOM, upstream
+    idle-kill) surfaces as a *degraded run*, not a broken job (t_3a2d5c8a / incident
+    t_3a513c34: the ``Non-streaming API call timed out after 180s`` storm that kept a
+    healthy monitor job failing every tick). Only the recognized stale-kill / timeout
+    signatures match; a plain exception, an auth error, a config-drift skip, or a broken
+    prompt do NOT — those stay a hard failure and keep climbing the streak.
+    """
+    text = (error or "").lower()
+    if not text:
+        return False
+    # Recognized transient signatures: the stale-kill watchdog ("stale for", "timed out",
+    # "no response", "no chunks", TimeoutError), idle-killed streams (BrokenPipe /
+    # RemoteProtocol from upstream idle-kill mid-think), and host OOM on a busy engine.
+    markers = (
+        "stale for", "timed out", "no response", "no chunks", "timeouterror",
+        "brokenpipeerror", "remoteprotocolerror", "out of memory",
+    )
+    return any(m in text for m in markers)
+
+
+def _transient_failure_streak_ceiling() -> int:
+    """Cap for the transient-timeout failure streak (t_3a2d5c8a).
+
+    ``cron.transient_failure_streak_ceiling`` (default 5, 0 = no cap). Read live so an
+    operator can tune it without a restart; on any read error fall back to the default.
+    The cap keeps the streak high enough to fire the review nudge (default threshold 3)
+    while stopping it from climbing unboundedly toward "this job is dead" / auto-disable.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        ceiling = ((cfg.get("cron") or {}) if isinstance(cfg, dict) else {}).get(
+            "transient_failure_streak_ceiling", 5)
+        ceiling = int(ceiling)
+    except Exception:
+        ceiling = 5
+    return ceiling
+
+
 def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
     status: Optional[str], now: str,
@@ -2229,7 +2271,21 @@ def _record_run_outcome(
     else:
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
-        job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+        #
+        # A *transient* LLM API / watchdog timeout (stale-kill, "no response", OOM on a
+        # queueing engine) is a **controlled degraded run**: the job is still healthy and
+        # enabled — the model was just slow/queueing this tick — so it must NOT push the
+        # streak toward "this job is dead" / auto-disable (t_3a2d5c8a item 4). Cap it at the
+        # configured ceiling (default 5, 0 = uncapped); alerting still flows through
+        # _failure_streak_nudge and the incident ledger. Hard failures (auth, config, broken
+        # prompt, unexpected exception) keep climbing uncapped so a genuinely broken job is
+        # not masked as a transient timeout storm.
+        if _is_transient_api_timeout_error(error):
+            ceiling = _transient_failure_streak_ceiling()
+            stored = int(job.get("failure_streak") or 0) + 1
+            job["failure_streak"] = min(stored, ceiling) if ceiling > 0 else stored
+        else:
+            job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
     job["last_delivery_error"] = delivery_error
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
