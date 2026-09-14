@@ -2047,6 +2047,19 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_retryable = retryable
         self._write_runtime_status_safe("fatal", platform_state="fatal", error_code=code, error_message=message)
 
+    def _needs_attention_on_fatal(self, code: str) -> None:
+        """Escalate a non-retryable fatal error to NEEDS_ATTENTION immediately.
+
+        The reconnect watcher's attention gate fires only after hours of queued
+        failure; a startup bind-failure is instantly visible and must surface
+        without waiting for that timer. Mirrors _flag_reconnect_needs_attention's
+        status write with platform_state="fatal" so `hermes status` / `/platform
+        list` show the red flag at connect time, not 2 h later."""
+        self._update_platform_runtime_status(
+            code, platform_state="fatal", needs_attention=True,
+            error_code=code, error_message=self._fatal_error_message,
+        )
+
     def _write_runtime_status_safe(self, context: str, **kwargs) -> None:
         """Write runtime status; log first failure per context at warning, rest at debug
         (failures — permissions, ENOSPC — must neither be silent nor spam reconnect loops)."""
