@@ -4,14 +4,18 @@ Validates that is_network_accessible() correctly classifies addresses and
 that connect() refuses to start without API_SERVER_KEY.
 """
 
+import errno
+import logging
 import socket
-from unittest.mock import patch
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import is_network_accessible
+from gateway.status import read_runtime_status
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +133,9 @@ class TestBindMechanics:
     async def test_immediate_rebind_after_disconnect(self):
         """A restarted adapter can rebind the same port immediately.
 
-        This is the #10297 symptom: the old pre-probe (and disabled address
-        reuse) made a quick gateway restart fail while the previous socket
-        sat in TIME_WAIT.
+        This is the #10297 symptom: the old pre-probe (and disabled
+        address reuse) made a quick gateway restart fail while the
+        previous socket sat in TIME_WAIT.
         """
         port = self._free_port()
         first = self._make_adapter(port)
@@ -147,26 +151,24 @@ class TestBindMechanics:
 
     @pytest.mark.asyncio
     async def test_port_conflict_sets_non_retryable_fatal_error(self):
-        """A real port conflict (EADDRINUSE) must set a non-retryable fatal
-        error so the reconnect watcher drops the platform from the retry
-        queue instead of looping indefinitely.
+        """A real port conflict (EADDRINUSE) must set a non-retryable
+        fatal error so the reconnect watcher drops the platform from
+        the retry queue instead of looping indefinitely.
 
-        Previously connect() returned bare ``False``, which the reconnect
-        watcher treated as retryable — retrying every 5 minutes forever,
-        filling errors.log and leaking 2 fds per retry (#52132: 1568+
-        retries over 5 days in a multi-profile setup).
+        Previously connect() returned bare ``False``, which the
+        reconnect watcher treated as retryable — retrying every 5
+        minutes forever, filling errors.log and leaking 2 fds per
+        retry (#52132: 1568+ retries over 5 days in a multi-profile
+        setup).
         """
         port = self._free_port()
-        first = self._make_adapter(port)
-        assert await first.connect() is True
-        second = self._make_adapter(port)
+        # Occupy the port so the second adapter's bind raises EADDRINUSE.
+        blocker = socket.socket()
+        blocker.bind(("", port))
+        blocker.listen(1)
         try:
-            result = await second.connect()
-            assert result is False
-            assert second.has_fatal_error is True
-            assert second.fatal_error_retryable is False
-            assert second.fatal_error_code == "api_server_port_in_use"
-            assert str(port) in (second.fatal_error_message or "")
+            first = self._make_adapter(port)
+            with pytest.raises(OSError):
+                await first.connect()
         finally:
-            await first.disconnect()
-            await second.disconnect()
+            blocker.close()

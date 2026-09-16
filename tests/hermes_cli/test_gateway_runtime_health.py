@@ -20,7 +20,8 @@ def test_runtime_health_lines_flags_stale_running_with_dead_pid(monkeypatch):
     from gateway import status as status_mod
 
     monkeypatch.setattr(
-        "gateway.status.read_runtime_status",
+        status_mod,
+        "read_runtime_status",
         lambda: {
             "gateway_state": "running",
             "pid": 4242,
@@ -44,8 +45,11 @@ def test_runtime_health_lines_flags_stale_running_with_dead_pid(monkeypatch):
 
 
 def test_runtime_health_lines_include_fatal_platform_and_startup_reason(monkeypatch):
+    from gateway import status as status_mod
+
     monkeypatch.setattr(
-        "gateway.status.read_runtime_status",
+        status_mod,
+        "read_runtime_status",
         lambda: {
             "gateway_state": "startup_failed",
             "exit_reason": "telegram conflict",

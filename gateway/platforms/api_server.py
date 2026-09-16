@@ -3971,25 +3971,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         f"platforms.api_server.port in config.yaml to a "
                         f"different value, then `/platform resume api_server`.",
                         retryable=False)
-                    self._needs_attention_on_fatal("api_server_port_in_use")
                     logger.error(
                         "[%s] Could not bind %s:%d: %s. Set a different port in "
                         "config.yaml: platforms.api_server.port",
                         self.name, self._host, self._port, exc)
-                    return False
-                self._needs_attention_on_fatal("api_server_bind_failed")
-                logger.error(
-                    "[%s] Could not bind %s:%d: %s. Set a different port in "
-                    "config.yaml: platforms.api_server.port",
-                    self.name, self._host, self._port, exc)
-                return False
-            from gateway.platforms.shared_ingress import listener_base_url
-            self._mark_connected(listener_base=listener_base_url(self._host, self._port))
+                    raise
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name)
             return True
         except Exception as e:
+            if isinstance(e, OSError):
+                raise
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
 
