@@ -34,6 +34,10 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Consecutive queued fatals before a plugin platform's circuit reads open (the
+# reconnect watcher keeps retrying underneath; "open" only gates eager work).
+_PLUGIN_CIRCUIT_OPEN_THRESHOLD = 5
+
 
 class GatewayAdapterLifecycleMixin:
     """Adapter lifecycle: connect/teardown, fatal recovery, reconnect watcher, multiplex profiles."""
@@ -194,6 +198,40 @@ class GatewayAdapterLifecycleMixin:
             self._track_task_in(tasks, asyncio.create_task(self._handle_adapter_fatal_error_detached(adapter)))
         )
 
+    @staticmethod
+    def _is_plugin_adapter_platform(platform) -> bool:
+        """True when *platform* is served by a plugin-registered adapter (builtins
+        resolve via ``_instantiate_builtin_adapter`` and never appear in the
+        registry). Never raises: worst case the platform keeps builtin handling."""
+        try:
+            from gateway.platform_registry import platform_registry
+            entry = platform_registry.get(platform.value)
+            return entry is not None and entry.source == "plugin"
+        except Exception:
+            return False
+
+    def _plugin_circuit_open(self, platform) -> bool:
+        """True once a plugin platform's consecutive failures reach the threshold
+        (counter resets when the platform reconnects — the queue entry is dropped
+        by ``_install_reconnected_adapter``)."""
+        info = getattr(self, "_failed_platforms", {}).get(platform)
+        return info is not None and info.get("consecutive_errors", 0) >= _PLUGIN_CIRCUIT_OPEN_THRESHOLD
+
+    def _record_plugin_adapter_failure(self, adapter) -> None:
+        """Bump the consecutive-failure counter on the queued entry; log when the
+        circuit opens. No entry (non-retryable / unqueueable) → nothing to track."""
+        info = getattr(self, "_failed_platforms", {}).get(adapter.platform)
+        if info is None:
+            return
+        consecutive = info.get("consecutive_errors", 0) + 1
+        info["consecutive_errors"] = consecutive
+        if consecutive == _PLUGIN_CIRCUIT_OPEN_THRESHOLD and self._is_plugin_adapter_platform(adapter.platform):
+            logger.warning(
+                "%s plugin circuit open after %d consecutive failures (%s) — "
+                "eager work gated, reconnect watcher keeps retrying in background.",
+                adapter.platform.value, consecutive, adapter.fatal_error_code or "unknown",
+            )
+
     def _reconnect_queue_entry(
         self, platform, adapter, platform_config, *, attempts: int, delay: float, queued: bool = True
     ) -> dict:
@@ -201,6 +239,7 @@ class GatewayAdapterLifecycleMixin:
         now = time.monotonic()
         return {
             "config": platform_config, "attempts": attempts, "next_retry": now + delay,
+            "consecutive_errors": 0,
             **({"queued_at": now} if queued else {}),
             "credential_claim": self._adapter_credential_claim(platform, adapter),
             "listener_claim": self._adapter_listener_claim(platform, adapter),
@@ -284,6 +323,22 @@ class GatewayAdapterLifecycleMixin:
                 and platform not in getattr(self, "_failed_platforms", {})
                 and not (shutdown_event is not None and shutdown_event.is_set())
             ):
+                if self._is_plugin_adapter_platform(platform):
+                    # Plugin failure with nowhere to queue (e.g. config entry gone):
+                    # record it as non-fatal and stay alive — a plugin must never
+                    # restart the gateway. The error is already on the runtime status.
+                    logger.warning(
+                        "%s plugin adapter failure is non-fatal (%s: %s); "
+                        "gateway continuing without restart.",
+                        platform.value, adapter.fatal_error_code or "unknown",
+                        adapter.fatal_error_message or "unknown error",
+                    )
+                    self._update_platform_runtime_status(
+                        platform.value, platform_state="retrying",
+                        error_code=adapter.fatal_error_code,
+                        error_message=adapter.fatal_error_message,
+                    )
+                    return
                 logger.error(
                     "%s adapter was lost without entering the reconnection "
                     "queue; exiting gateway so the service manager restarts it.", platform.value,
@@ -328,6 +383,7 @@ class GatewayAdapterLifecycleMixin:
             self.delivery_router.adapters = self.adapters
         # Queue BEFORE any disconnect await: a wedged close() once left platforms permanently deaf.
         self._queue_retryable_fatal_platform(adapter)
+        self._record_plugin_adapter_failure(adapter)
         if existing is adapter:
             # Bounded by the shutdown-path timeout so this always returns to the stranded check.
             # Queue retryable failures BEFORE any disconnect await (#80598). A half-dead transport can wedge
@@ -338,6 +394,16 @@ class GatewayAdapterLifecycleMixin:
             await self._safe_adapter_disconnect(adapter, adapter.platform)
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
+            if adapter.fatal_error_retryable and self._is_plugin_adapter_platform(adapter.platform):
+                # Last platform standing was a plugin: stay alive (cron runs, manual
+                # recovery possible) instead of stopping/restarting the gateway.
+                logger.warning(
+                    "Last remaining platform %s is a plugin adapter with error (%s): %s — "
+                    "gateway staying alive without restart.",
+                    adapter.platform.value, adapter.fatal_error_code or "unknown",
+                    adapter.fatal_error_message or "unknown error",
+                )
+                return
             if adapter.fatal_error_retryable:
                 self._exit_with_failure = True
                 logger.error("No connected messaging platforms remain. Shutting down gateway for service restart.")
