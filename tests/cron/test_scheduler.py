@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import (
+    DRIFT_SKIP_MARKER,
     SILENT_MARKER,
     _build_job_prompt,
     _deliver_result,
@@ -22,6 +23,11 @@ from cron.scheduler import (
 from cron.scheduler_delivery import _resolve_origin, _send_media_via_adapter
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestSchedulerMarkers:
+    def test_drift_skip_marker_is_a_warning(self):
+        assert DRIFT_SKIP_MARKER == "WARNING"
 
 
 class TestSummarizeCronFailureForDelivery:
