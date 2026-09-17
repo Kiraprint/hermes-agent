@@ -3971,6 +3971,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         f"platforms.api_server.port in config.yaml to a "
                         f"different value, then `/platform resume api_server`.",
                         retryable=False)
+                    self._write_runtime_status_safe(
+                        "api_server_port_in_use", platform_state="fatal",
+                        error_code="api_server_port_in_use",
+                        error_message=self._fatal_error_message or f"Port {self._port} already in use",
+                        needs_attention=True)
                     logger.error(
                         "[%s] Could not bind %s:%d: %s. Set a different port in "
                         "config.yaml: platforms.api_server.port",
