@@ -472,7 +472,12 @@ from cron.executions import (
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
 
-# Marker used by downstream runtime guards to distinguish recoverable drift skips.
+# Marker set by downstream runtime guards to signal a recoverable drift skip.
+# The guard downgrades repeated drift skips to WARNING (not ERROR) so they
+# suppress delivery without creating an incident — repeated skips never trip
+# the circuit breaker. DELIVERY_SUPPRESS marker in the error string carries
+# the reason; the presence of DRIFT_SKIP_MARKER ("WARNING") in the error
+# is the downstream signal that this run was skipped, not failed.
 DRIFT_SKIP_MARKER = "WARNING"
 
 
@@ -2551,11 +2556,11 @@ def _compose_run_delivery(
             "This alert is sent once; the job stays blocked until the configuration is fixed."
         )
     elif not success and BLOCKED_CONFIG_MARKER not in err and DRIFT_SKIP_MARKER in err:
-        # Drift-skip: operator was already warned (SKIPPED + reason in error).
-        # Suppress per-run ping — no spend occurred.
+        # Downgraded drift skip (WARNING, not ERROR): repeated drift skips skip
+        # the incident/ack path entirely — no ping, no spend. Suppress per-run
+        # delivery; the reason is embedded in the error string itself.
         deliver_content = ""
         incident_acked = True
-        failure_incident_id = None
     elif success:
         deliver_content = final_response
     else:
