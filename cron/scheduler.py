@@ -38,7 +38,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
-    _expand_env_vars, load_config, resolve_cron_model_drift_defaults)
+    _expand_env_vars, load_config, resolve_cron_model_drift_defaults,
+    _cron_fleet_default_covers_axis, cron_model_drift_guard_enabled)
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
@@ -470,6 +471,9 @@ from cron.executions import (
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
+
+# Marker used by downstream runtime guards to distinguish recoverable drift skips.
+DRIFT_SKIP_MARKER = "WARNING"
 
 
 def _is_cron_silence_response(text: str) -> bool:
@@ -2546,6 +2550,12 @@ def _compose_run_delivery(
             f"{_pf_text} "
             "This alert is sent once; the job stays blocked until the configuration is fixed."
         )
+    elif not success and BLOCKED_CONFIG_MARKER not in err and DRIFT_SKIP_MARKER in err:
+        # Drift-skip: operator was already warned (SKIPPED + reason in error).
+        # Suppress per-run ping — no spend occurred.
+        deliver_content = ""
+        incident_acked = True
+        failure_incident_id = None
     elif success:
         deliver_content = final_response
     else:
