@@ -471,6 +471,9 @@ from cron.executions import (
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
 
+# Marker used by downstream runtime guards to distinguish recoverable drift skips.
+DRIFT_SKIP_MARKER = "WARNING"
+
 
 def _is_cron_silence_response(text: str) -> bool:
     """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
