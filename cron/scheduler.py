@@ -471,6 +471,9 @@ from cron.executions import (
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
 
+# Marker used by downstream runtime guards to distinguish recoverable drift skips.
+DRIFT_SKIP_MARKER = "WARNING"
+
 
 def _is_cron_silence_response(text: str) -> bool:
     """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
@@ -2546,6 +2549,12 @@ def _compose_run_delivery(
             f"{_pf_text} "
             "This alert is sent once; the job stays blocked until the configuration is fixed."
         )
+    elif not success and BLOCKED_CONFIG_MARKER not in err and DRIFT_SKIP_MARKER in err:
+        # Drift-skip: operator was already warned (SKIPPED + reason in error).
+        # Suppress per-run ping — no spend occurred.
+        deliver_content = ""
+        incident_acked = True
+        failure_incident_id = None
     elif success:
         deliver_content = final_response
     else:
