@@ -1016,6 +1016,9 @@ _ZAI_POLICY_NOTES = {
 }
 
 
+_HTTP_OVERLOAD_BASE_DELAY = 10.0
+
+
 def compute_error_backoff(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int, is_rate_limited: bool,
     is_zai_coding_overload: bool, base_url: Any, model: Any,
@@ -1054,7 +1057,11 @@ def compute_error_backoff(
             # past, which the parser clamps to 0.0) carries no usable wait —
             # treat it as absent so we never hot-loop the provider.
             _retry_after = None
-    wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+    status_code = getattr(api_error, "status_code", None)
+    base_delay = _HTTP_OVERLOAD_BASE_DELAY if status_code in {503, 529} else 2.0
+    wait_time = _retry_after if _retry_after is not None else jittered_backoff(
+        retry_count, base_delay=base_delay, max_delay=60.0,
+    )
     _backoff_policy = None
     _adaptive = is_rate_limited or is_zai_coding_overload
     if _adaptive and _retry_after is None:
