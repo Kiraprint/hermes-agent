@@ -4758,6 +4758,51 @@ class TestRunConversation:
         assert agent.context_compressor.context_length == 200_000
         mock_compress.assert_called_once()
 
+    def test_vllm_190000_output_cap_retry_recovers(self, agent):
+        """Regression for the qwen3.8/local-vllm 190001-token incident."""
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "local-vllm"
+        agent.model = "qwen3.8-27b-nvfp4"
+        agent.max_tokens = 65_536
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 190_000
+        agent.context_compressor.should_compress = MagicMock(return_value=True)
+
+        error_msg = (
+            "This model's maximum context length is 190000 tokens. However, "
+            "you requested 65536 output tokens and your prompt contains at "
+            "least 124465 input tokens, for a total of at least 190001 "
+            "tokens. Please reduce the length of the input prompt or the "
+            "number of requested output tokens."
+        )
+        exc = Exception(error_msg)
+        exc.status_code = 400
+        exc.code = 400
+        ok_resp = _mock_response(content="done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+
+        mock_compress = MagicMock(return_value=(
+            [{"role": "user", "content": "hello"}],
+            "You are helpful.",
+        ))
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent.context_compressor, "update_model"),
+            patch.object(agent, "_compress_context", mock_compress),
+        ):
+            result = agent.run_conversation("hello")
+
+        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert result["completed"] is True
+        # vLLM's derived input is not a real measurement: 65536 is halved,
+        # then the recovery safety margin is applied.
+        assert second_call["max_tokens"] <= 32_704
+        assert agent.context_compressor.context_length == 190_000
+        mock_compress.assert_called_once()
+
     def test_output_cap_retry_before_generic_retry_exhaustion(self, agent):
         """Provider max-output-cap 400s clamp via the output-cap handler, not
         the generic retry loop ("failed after 3 retries").
