@@ -241,3 +241,19 @@ def test_stale_claim_without_pr_reclaims_ready(conn):
     reclaimed = kb.release_stale_claims(conn)
     assert reclaimed == 1
     assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_stale_comment_not_guarded(conn):
+    """Expired PR comment must not hold the task under active_pr.
+
+    Regression: ``check_respawn_guard`` uses ``created_at >= pr_cutoff``,
+    so a comment older than ``_RESPAWN_GUARD_PR_WINDOW`` must return None
+    even when a fresh PR URL is present.
+    """
+    tid = kb.create_task(conn, title="stale comment", assignee="w")
+    kb.claim_task(conn, tid)
+    kbd._set_worker_pid(conn, tid, _dead_pid(raw_status=0))
+    old = int(__import__("time").time()) - kbd._RESPAWN_GUARD_PR_WINDOW - 60
+    kb.add_comment(conn, tid, "worker", PR_COMMENT, created_at=old)
+
+    assert kbd.check_respawn_guard(conn, tid) is None

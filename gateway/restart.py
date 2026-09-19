@@ -19,7 +19,9 @@ GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
 EXTERNAL_GATEWAY_SUPERVISOR_ENV = "HERMES_GATEWAY_EXTERNAL_SUPERVISOR"
 
 DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["restart_drain_timeout"])
-DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT = float(DEFAULT_CONFIG["gateway"]["signal_interrupt_grace_timeout"])
+DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT = float(
+    DEFAULT_CONFIG.get("gateway", {}).get("signal_interrupt_grace_timeout", 5.0)
+)
 DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT = 5.0
 
 # In-band restart waits for active turns to finish *before* ``stop()`` begins; distinct from
