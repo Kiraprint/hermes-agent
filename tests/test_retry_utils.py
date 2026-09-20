@@ -169,6 +169,32 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
 
+def test_compute_error_backoff_uses_longer_schedule_for_503(monkeypatch):
+    """HTTP 503/529 overloads get enough time to recover before the bounded retries run out."""
+    from agent import turn_recovery
+
+    monkeypatch.setattr(
+        "agent.retry_utils.jittered_backoff",
+        lambda attempt, **kwargs: kwargs["base_delay"] * (2 ** (attempt - 1)),
+    )
+    agent = SimpleNamespace(
+        _buffer_status=lambda _status: None,
+        _client_log_context=lambda: "test",
+    )
+    error = SimpleNamespace(status_code=503, response=SimpleNamespace(headers={}), body={})
+
+    assert turn_recovery.compute_error_backoff(
+        agent, error, retry_count=1, max_retries=3,
+        is_rate_limited=False, is_zai_coding_overload=False,
+        base_url="https://provider.example/v1", model="test-model",
+    ) == 10.0
+    assert turn_recovery.compute_error_backoff(
+        agent, error, retry_count=2, max_retries=3,
+        is_rate_limited=False, is_zai_coding_overload=False,
+        base_url="https://provider.example/v1", model="test-model",
+    ) == 20.0
+
+
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------

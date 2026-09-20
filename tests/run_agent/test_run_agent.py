@@ -1907,6 +1907,43 @@ class TestExecuteToolCalls:
         assert "Rate limit reached" not in output
 
 
+def test_transient_503_retries_without_terminal_error(agent, caplog):
+    """A single HTTP 503 recovers on the next bounded attempt; only sustained outages exhaust retries."""
+    class _ServiceUnavailableError(Exception):
+        status_code = 503
+
+        def __init__(self):
+            super().__init__("HTTP 503 Service Unavailable")
+            self.response = SimpleNamespace(headers={})
+            self.body = {}
+
+    responses = [_ServiceUnavailableError(), _mock_response(content="Recovered")]
+    calls = []
+
+    def _fake_api_call(_api_kwargs):
+        calls.append(_api_kwargs)
+        result = responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    agent._interruptible_api_call = _fake_api_call
+    agent._persist_session = lambda *args, **kwargs: None
+    agent._save_trajectory = lambda *args, **kwargs: None
+    agent._cleanup_task_resources = lambda *args, **kwargs: None
+
+    with (
+        patch("agent.relay_llm.execute", side_effect=lambda request, callback, **kwargs: callback(request)),
+        caplog.at_level(logging.ERROR, logger="agent.conversation_loop"),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered"
+    assert len(calls) == 2
+    assert "API call failed after 3 retries" not in caplog.text
+
+
 class TestRetryAfterCap:
     """The loop honors provider cooldowns up to a 600-second ceiling.
 
