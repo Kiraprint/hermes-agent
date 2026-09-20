@@ -146,12 +146,26 @@ class TestParseVllmTokenBasedOutputCap:
         "of the input prompt or the number of requested output tokens."
     )
 
+    # Verbatim incident shape: 124465 input + 65536 output = 190001 > 190000.
+    _VLLM_MSG_190000 = (
+        "This model's maximum context length is 190000 tokens. However, you "
+        "requested 65536 output tokens and your prompt contains at least "
+        "124465 input tokens, for a total of at least 190001 tokens. Please "
+        "reduce the length of the input prompt or the number of requested "
+        "output tokens."
+    )
+
     def test_vllm_token_based_format(self):
         # The reported input is a LOWER BOUND that vLLM back-computes from the
         # constraint (65537 == 131072 + 1 - 65536), so window - input is just
         # requested - 1 and carries no information about the real prompt.
         # Halve the requested cap instead so the retry actually converges.
         assert parse_available_output_tokens_from_error(self._VLLM_MSG) == 32768
+
+    def test_vllm_incident_190000_window(self):
+        assert parse_available_output_tokens_from_error(
+            self._VLLM_MSG_190000
+        ) == 32768
 
     def test_vllm_measured_input_is_trusted(self):
         # When the input is measured rather than derived, use it as-is.
