@@ -11,7 +11,9 @@ import re
 import smtplib
 import socket
 import ssl
+import time
 import uuid
+from collections import deque
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -19,7 +21,7 @@ from email.mime.base import MIMEBase
 from email.utils import formatdate
 from email import encoders
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from gateway.platforms.base import (
     BasePlatformAdapter, SendResult,
@@ -332,6 +334,25 @@ class EmailAdapter(BasePlatformAdapter):
     # adapter per retry; without this connect(is_reconnect=True) would re-mark the mailbox seen and skip
     # mail that arrived during the outage. Keyed by address (multiplex runs several accounts); same-process only.
     _seen_uids_snapshot: Dict[str, set] = {}
+    # Transient error episode state: {address: {started_at, errors: deque[(monotonic, class)], count, alert_emitted, last_class}}
+    # Class-level (like _seen_uids_snapshot): the reconnect watcher builds a FRESH adapter per retry, so per-instance
+    # state would lose episode continuity across reconnects.
+    _imap_transient_episodes: Dict[str, Dict[str, Any]] = {}
+    _imap_transient_alert_handler: Optional[Callable[[Dict[str, Any]], None]] = None
+    # Option-A classification policy (spec t_51191992): only these classes can be transient…
+    _TRANSIENT_IMAP_CLASSES = (socket.timeout, TimeoutError, BrokenPipeError,
+                               ConnectionResetError, ConnectionAbortedError, ssl.SSLError)
+    # …and only with one of these observed failure signatures (egress flaps, not bad credentials)…
+    _TRANSIENT_IMAP_SIGNATURES = ("handshake operation timed out", "the read operation timed out",
+                                  "unexpected_eof_while_reading", "errno 104", "errno 110", "errno 10054")
+    # …and only in network phases (a parse-phase timeout is a code bug, not the egress flap).
+    _TRANSIENT_IMAP_PHASES = frozenset({"connect", "login", "select", "search", "fetch"})
+    # Alert thresholds: M errors in a 15-min sliding window OR N minutes without a successful reconnect
+    # → one digest alert per episode. Baseline flap rate is 23 errors/18.5h, so 5/15min is ~60× the
+    # observed spike peak (3-4/h) — a real degradation trips it, ordinary flapping does not.
+    _IMAP_TRANSIENT_M_ERRORS = 5
+    _IMAP_TRANSIENT_WINDOW_SECONDS = 15 * 60
+    _IMAP_TRANSIENT_N_MINUTES = 5
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
@@ -363,7 +384,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
-        self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
+        self._last_fetch_failed, self._last_fetch_error, self._last_fetch_exc = False, "", None  # "checked, nothing new" vs "the check itself failed"
         # chat_id (sender email) -> last subject + message-id for threading
         # Track the last IMAP fetch attempt so the poll loop can distinguish "checked, nothing new" from
         # "the check itself failed" (#80016).
@@ -380,6 +401,62 @@ class EmailAdapter(BasePlatformAdapter):
             logger.debug("[Email] Trimmed seen UIDs to %d entries", len(self._seen_uids))
         except (ValueError, TypeError):
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    @classmethod
+    def _is_imap_transient_error(cls, exc: BaseException, phase: str) -> bool:
+        """Option-A classification (spec t_51191992): transient ONLY for a network-class exception
+        with a recognized egress-flap signature in a network phase. AUTH NO, DB and parse errors
+        are never transient — they stay fully visible (ERROR per attempt, immediate alert)."""
+        if not isinstance(exc, cls._TRANSIENT_IMAP_CLASSES) or str(phase).lower() not in cls._TRANSIENT_IMAP_PHASES:
+            return False
+        message = str(exc).lower()
+        return any(signature in message for signature in cls._TRANSIENT_IMAP_SIGNATURES)
+
+    @classmethod
+    def set_imap_transient_alert_handler(cls, handler: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        """Health-digest hook: called at most ONCE per transient episode, when the flap exceeds the
+        alert threshold (M errors within the 15-min window OR N minutes without a successful
+        reconnect). The payload carries the N/M counters so the digest can render them. AUTH/DB
+        failures never reach this path — they stay a per-attempt ERROR + immediate fatal."""
+        cls._imap_transient_alert_handler = handler
+
+    def _record_imap_transient_error(self, phase: str, exc: BaseException, *, context: str = "fetch") -> None:
+        """Book one transient error into this address's episode: the FIRST error of an episode logs
+        at ERROR, repeats log at DEBUG with ``(xN, same class)`` (suppression), and the digest alert
+        fires exactly once per episode when the threshold trips."""
+        now = time.monotonic()
+        class_name = type(exc).__name__
+        ep = self._imap_transient_episodes.get(self._address)
+        if ep is None:
+            ep = {"started_at": now, "errors": deque(), "count": 0, "alert_emitted": False, "last_class": class_name}
+            self._imap_transient_episodes[self._address] = ep
+        ep["errors"].append((now, class_name))
+        while ep["errors"] and now - ep["errors"][0][0] > self._IMAP_TRANSIENT_WINDOW_SECONDS:
+            ep["errors"].popleft()
+        ep["count"] += 1
+        ep["last_class"] = class_name
+        window_count = len(ep["errors"])
+        if ep["count"] == 1:
+            logger.error("[Email] IMAP %s error: %s (phase=%s, transient — repeats suppressed until recovery)", context, exc, phase)
+        else:
+            logger.debug("[Email] IMAP %s error: %s (x%d, same class, phase=%s, suppressed)", context, exc, ep["count"], phase)
+        threshold_hit = window_count >= self._IMAP_TRANSIENT_M_ERRORS or now - ep["started_at"] >= self._IMAP_TRANSIENT_N_MINUTES * 60
+        # Class access on purpose: a PLAIN function stored as a class attribute binds as a method
+        # when read through the instance (self + payload = TypeError) — the production handler is
+        # exactly such a plain function (see register()/_log_imap_transient_alert).
+        handler = type(self)._imap_transient_alert_handler
+        if threshold_hit and not ep["alert_emitted"] and handler is not None:
+            ep["alert_emitted"] = True
+            handler({"address": self._address, "class": class_name, "count": ep["count"],
+                    "window_count": window_count, "duration_seconds": int(now - ep["started_at"]), "phase": phase})
+
+    def _end_imap_transient_episode(self) -> None:
+        """A successful IMAP command ends the episode for this address: one recovery summary, state
+        dropped so the NEXT episode re-arms the alert. No-op when the episode is already closed."""
+        ep = self._imap_transient_episodes.pop(self._address, None)
+        if ep is None or not ep["count"]:
+            return
+        logger.info("[Email] IMAP fetch recovered after %d consecutive %s error(s)", ep["count"], ep["last_class"])
 
     def _connect_imap(self) -> imaplib.IMAP4:
         """Create an IMAP connection using implicit TLS, STARTTLS, or plaintext."""
@@ -446,8 +523,16 @@ class EmailAdapter(BasePlatformAdapter):
                 self._trim_seen_uids()
                 logger.info(passed, len(self._seen_uids))
             self._seen_uids_snapshot[self._address] = set(self._seen_uids)
+            self._end_imap_transient_episode()  # a successful probe is a successful IMAP command (spec §2)
             return True
         except Exception as e:
+            if self._is_imap_transient_error(e, "connect"):
+                # Transient connect-phase flap: same episode policy as fetch (first = ERROR, repeats suppressed,
+                # one digest alert per episode); the reconnect watcher keeps retrying under the transient fatal code.
+                self._record_imap_transient_error("connect", e, context="connect")
+                self._set_fatal_error("email_imap_transient_error",
+                                      f"IMAP connection to {self._imap_host}:{self._imap_port} failed: {e}", retryable=True)
+                return False
             # Always set an explicit fatal code, else the gateway treats every failure as transient with zero
             # owner signal. retryable=True because imaplib raises the same generic IMAP4.error for bad credentials
             # AND transient NOs (Gmail "too many simultaneous connections"); loops surface via NEEDS_ATTENTION.
@@ -517,13 +602,25 @@ class EmailAdapter(BasePlatformAdapter):
         for msg_data in messages:
             await self._dispatch_message(msg_data)
         if self._last_fetch_failed:
-            # The IMAP check itself failed (not an empty inbox): route through the fatal-error hook so the gateway's
-            # reconnect/backoff re-establishes the mailbox. The handler runs detached (gateway/run.py), so awaiting it is safe.
-            # The handler runs in a detached task (gateway/run.py), so awaiting it from our own poll task is
-            # safe even though teardown cancels this task. See #80016.
-            self._last_fetch_failed = False
-            self._set_fatal_error("email_imap_fetch_failed", self._last_fetch_error or "IMAP fetch failed", retryable=True)
-            await self._notify_fatal_error()
+            # The IMAP check itself failed (not an empty inbox): route through the fatal-error hook so the
+            # gateway's reconnect/backoff re-establishes the mailbox. The handler runs in a detached task
+            # (gateway/run.py), so awaiting it from our own poll task is safe even though teardown cancels
+            # this task. See #80016.
+            fetch_error, fetch_exc = self._last_fetch_error, self._last_fetch_exc
+            self._last_fetch_failed, self._last_fetch_error, self._last_fetch_exc = False, "", None
+            if fetch_exc is not None and self._is_imap_transient_error(fetch_exc, "fetch"):
+                # Transient egress flap (option A): first error of the episode = ERROR + one FATAL notify,
+                # repeats suppressed at DEBUG, digest alert at most once when the N/M threshold trips.
+                pre_count = self._imap_transient_episodes.get(self._address, {}).get("count", 0)
+                self._record_imap_transient_error("fetch", fetch_exc)
+                self._set_fatal_error("email_imap_transient_error", fetch_error or "IMAP fetch failed", retryable=True)
+                if pre_count == 0:
+                    await self._notify_fatal_error()
+            else:
+                # Real failure (AUTH NO, DB, ...): every attempt stays ERROR + immediate fatal — no suppression, no dedup.
+                logger.error("[Email] IMAP fetch error: %s", fetch_error)
+                self._set_fatal_error("email_imap_fetch_failed", fetch_error or "IMAP fetch failed", retryable=True)
+                await self._notify_fatal_error()
 
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
@@ -562,11 +659,15 @@ class EmailAdapter(BasePlatformAdapter):
                         results.append(parsed)
         except Exception as e:
             # _close_imap guarantees the socket dies even when logout() raises IMAP4.abort on a broken
-            # connection (#79889).
-            logger.error("[Email] IMAP fetch error: %s", e)
-            self._last_fetch_failed, self._last_fetch_error = True, str(e)
+            # connection (#79889). The log is owned by _check_inbox under episode policy: a transient
+            # first error logs ERROR and repeats are suppressed; non-transient (AUTH/DB) stays ERROR
+            # per attempt — so the connection-level log moves out of the hot path and into the policy.
+            self._last_fetch_failed, self._last_fetch_error, self._last_fetch_exc = True, str(e), e
         # Keep the reconnect snapshot current so a mid-outage adapter recreation does not re-dispatch messages already processed.
         self._seen_uids_snapshot[self._address] = set(self._seen_uids)
+        if not self._last_fetch_failed:
+            # A successful IMAP command ends any open transient episode (spec §2) and re-arms the alert.
+            self._end_imap_transient_episode()
         return results
 
     def _parse_fetched_message(self, uid: bytes, raw_email: "bytes | bytearray") -> Optional[Dict[str, Any]]:
@@ -800,6 +901,23 @@ def _is_connected(config) -> bool:
     return bool((gateway_mod.get_env_value("EMAIL_ADDRESS") or "").strip())
 
 
+def _log_imap_transient_alert(payload: Dict[str, Any]) -> None:
+    """Default alert sink for a sustained transient IMAP episode (option A, spec t_51191992).
+
+    Wired in ``register()`` so every gateway process that loads the email plugin gets it;
+    digest integrations and tests may override via ``EmailAdapter.set_imap_transient_alert_handler``.
+    ONE ERROR line per episode (N/M threshold), carrying the counters, landing in gateway.log
+    and errors.log where the factory health digest reads them — distinct from the per-attempt
+    ``[Email] IMAP fetch error`` lines and from AUTH/DB failures, which are never suppressed."""
+    logger.error(
+        "[Email] IMAP transient alert: sustained flap on %s — %d error(s), %d within the %d-min window, "
+        "no successful reconnect for %ds (class=%s, phase=%s)",
+        payload.get("address"), payload.get("count"), payload.get("window_count"),
+        EmailAdapter._IMAP_TRANSIENT_WINDOW_SECONDS // 60, payload.get("duration_seconds"),
+        payload.get("class"), payload.get("phase"),
+    )
+
+
 def _build_adapter(config):
     """Factory wrapper that constructs EmailAdapter from a PlatformConfig."""
     return EmailAdapter(config)
@@ -807,6 +925,10 @@ def _build_adapter(config):
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+    # Wire the transient-episode alert into this process (spec t_51191992 §3): without a handler
+    # the threshold alert is dead code. Kept here (not in __init__) so the policy has exactly one
+    # production call-site, runs once per process, and stays overridable for tests/digest wiring.
+    EmailAdapter.set_imap_transient_alert_handler(_log_imap_transient_alert)
     ctx.register_platform(
         name="email", label="Email", adapter_factory=_build_adapter, check_fn=check_email_requirements, is_connected=_is_connected,
         required_env=["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_SMTP_HOST"],
