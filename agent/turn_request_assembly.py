@@ -176,7 +176,7 @@ def assemble_api_request(
     for am in api_messages:
         if isinstance(am.get("content"), str):
             am["content"] = am["content"].strip()
-    _canonicalize_api_tool_calls(api_messages)
+    _canonicalize_api_tool_calls(api_messages, getattr(agent, "session_id", None))
 
     # Strip lone surrogates (U+D800-U+DFFF) that some Ollama-served models emit;
     # they crash json.dumps() inside the OpenAI SDK and trigger the 3-retry cycle.
