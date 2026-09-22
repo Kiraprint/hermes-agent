@@ -35,6 +35,7 @@ from agent.gemini_native_adapter import is_native_gemini_base_url
 # boxes. Non-Ollama remotes (sglang, vLLM, OpenAI-compat) expose Ollama-compat endpoints that can
 # misidentify and, without an api_key, return 401 on every leg (issue #89863).
 from agent.model_metadata import is_local_endpoint
+from agent.output_budget import apply_output_window_guard
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import (_sanitize_surrogates, _repair_tool_call_arguments)
@@ -1366,10 +1367,16 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     affinity header rides on every OpenCode request regardless of transport
     (chat_completions / codex_responses / anthropic_messages all route
     OpenCode models). No-op for every other provider.
+
+    Also the single place where an outbound output cap meets the prompt it
+    shares the window with: ``max_tokens`` is a reservation on the context the
+    messages already occupy, so it is derived here rather than trusted as a
+    constant (a cap larger than the remaining window is an instant provider 400).
     """
     from agent.opencode_affinity import merge_opencode_session_headers
 
     kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
+    apply_output_window_guard(agent, kwargs, prompt_tokens=estimate_request_context_tokens(kwargs))
     return merge_opencode_session_headers(
         kwargs,
         getattr(agent, "provider", None),

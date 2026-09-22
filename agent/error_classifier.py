@@ -653,6 +653,16 @@ def _by_transport(c: _Ctx) -> Optional[Verdict]:
     return _V_TIMEOUT if transport else None
 
 
+def _pre_send_output_window(c: _Ctx) -> Optional[Verdict]:
+    """The outbound-cap guard refused the request before it hit the wire (agent/output_budget).
+
+    The prompt already consumed the window, so retrying the identical request cannot
+    succeed — this is a context overflow, and compression is the only real fix.
+    """
+    from agent.output_budget import OutputWindowExhausted
+    return _V_CONTEXT_OVERFLOW if isinstance(c.error, OutputWindowExhausted) else None
+
+
 def _by_status(c: _Ctx) -> Optional[Verdict]:
     """HTTP status code with message-aware refinement (unlisted 4xx/5xx → generic)."""
     status = c.status_code
@@ -662,11 +672,11 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
     return _STATUS_HANDLERS[status](c) if status in _STATUS_HANDLERS else default
 
 
-# Stage order: plugin hooks → provider-specific special cases → HTTP status →
-# MoA shapes → structured error code → message patterns → SSL → disconnect +
-# large session → transport types → unknown (retryable with backoff).
+# Stage order: plugin hooks → pre-send output-window refusal → provider-specific special
+# cases → HTTP status → MoA shapes → structured error code → message patterns → SSL →
+# disconnect + large session → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
-    _plugin_verdict, _provider_special_cases, _by_status, _moa_special_cases,
+    _plugin_verdict, _pre_send_output_window, _provider_special_cases, _by_status, _moa_special_cases,
     _by_error_code, _by_message, _by_transport,
 )
 
