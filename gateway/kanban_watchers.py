@@ -34,6 +34,9 @@ _LOCAL_PATH_RE = re.compile(
     r"[A-Za-z]:\\[^\s,;]+)"
 )
 
+# Fork-sync health feed: settle before the first read so gateway startup never waits on it.
+_FORK_SYNC_HEALTH_SETTLE_SECONDS = 10.0
+
 
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
@@ -1544,6 +1547,52 @@ class GatewayKanbanWatchersMixin:
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+
+    async def _fork_sync_health_watcher(self) -> None:
+        """Fork-sync divergence health feed — reports, never blocks dispatch.
+
+        Refreshes :mod:`agent.monitoring.fork_sync_health` on an interval: age of
+        the last successful fork/upstream sync, the last run's exit code, and how
+        many conflict-escalation tasks are still open on the board. Every
+        transition into degraded/unhealthy is logged as a structured WARNING
+        (bridged to the monitoring plane for ``gateway.*`` loggers), and the
+        state is readable from the readiness endpoint and the
+        ``hermes.fork_sync.*`` gauges.
+
+        Fail-open by construction: a broken log or board read is a *status*, not
+        an exception, and the loop body is wrapped again here. The dispatcher and
+        the ready queue must keep running while fork-sync is failed — that is the
+        invariant this feed reports on, so it can never be the thing that breaks
+        it.
+        """
+        from gateway.run_watchers import _interruptible_sleep
+
+        try:
+            from agent.monitoring import fork_sync_health
+            settings = fork_sync_health.resolve_fork_sync_settings()
+        except Exception as exc:
+            logger.warning("fork-sync health: settings unavailable (error_type=%s)", type(exc).__name__)
+            return
+        if not settings.enabled:
+            logger.info("fork-sync health: feed disabled via config fork_sync.enabled=false")
+            return
+
+        interval = max(30.0, float(settings.health_interval_seconds))
+        # Short settle so gateway startup never waits on the feed.
+        await asyncio.sleep(min(_FORK_SYNC_HEALTH_SETTLE_SECONDS, interval))
+        while self._running:
+            try:
+                # Off-loop: the refresh reads a log file and the board DB.
+                snapshot = await asyncio.to_thread(fork_sync_health.refresh_fork_sync_health, settings)
+                self._fork_sync_health = snapshot.state
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Belt and braces: the feed is already fail-open, so a raise here means
+                # a projection bug — still never a reason to stop dispatching.
+                logger.warning("fork-sync health: refresh failed (error_type=%s)", type(exc).__name__)
+                logger.debug("fork-sync health: refresh traceback", exc_info=True)
+            await _interruptible_sleep(self, int(interval))
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
