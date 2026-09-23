@@ -1,8 +1,11 @@
 """Tests for _repair_tool_call_arguments — malformed JSON repair pipeline."""
 
 import json
+import logging
 
-from agent.message_sanitization import _repair_tool_call_arguments
+from agent.message_sanitization import (
+    _repair_escaped_structural_quotes, _repair_python_literals, _repair_tool_call_arguments,
+)
 class TestRepairToolCallArguments:
     """Verify each repair stage in the pipeline."""
 
@@ -59,3 +62,47 @@ class TestRepairToolCallArguments:
     # -- Stage 4: control-char escape fallback --
 
 
+class TestLoggedUnrepairablePayload:
+    """Regression for the 2026-09-18 kanban_complete drop (errors.log.1:10279).
+
+    The logged argument string was 750 bytes: a Python ``False``, the
+    ``specific_pattern_searched`` value sent one escape level too deep
+    (``"key": \"value\"``), an excess closing brace and a stray ``]`` — every one of
+    them a defect the earlier passes cannot express, so the call was dropped as
+    ``"{}"`` and kanban_complete ran with no arguments at all.
+    """
+
+    LOGGED_PAYLOAD = (
+        '{"task_id": "t_0090c345", "summary": "Completed incident evidence extraction from errors.log. Produced comprehensive report showing the specific subagent-1 HTTP 503 pattern does not exist in the log. Total ERROR lines in last hour: 84, all are streaming failures from various providers. Report saved as incident_report.txt in workspace.", "metadata": {"total_errors_last_hour": 84, "subagent_503_pattern_found": False, "specific_pattern_searched": \\"[subagent-1] API call failed after 3 retries. HTTP 503\\", "error_patterns_found": 84, "unique_error_messages": 84, "warning_info_context_lines": 70, "report_file_path": "/opt/data/kanban/boards/factory/workspaces/t_0090c345/incident_report.txt", "completion_timestamp": "2026-09-18 00:10:37 UTC"}}}\n]'
+    )
+
+    def test_logged_payload_is_repaired_instead_of_dropped(self):
+        repaired = _repair_tool_call_arguments(self.LOGGED_PAYLOAD, "kanban_complete")
+        parsed = json.loads(repaired)  # "{}" (the old drop) parses too, keys below are the contract
+        assert parsed["task_id"] == "t_0090c345"
+        assert parsed["summary"].startswith("Completed incident evidence extraction")
+        assert parsed["metadata"]["subagent_503_pattern_found"] is False
+        assert parsed["metadata"]["specific_pattern_searched"] == (
+            "[subagent-1] API call failed after 3 retries. HTTP 503"
+        )
+        assert parsed["metadata"]["report_file_path"].endswith("t_0090c345/incident_report.txt")
+
+    def test_escaped_quotes_inside_string_values_are_untouched(self):
+        """The structural-quote pass must never rewrite a real ``\\"`` escape in quoted content."""
+        valid = '{"summary": "he said \\"hi\\" to None, loudly", "subagent_503_pattern_found": false}'
+        assert _repair_python_literals(valid) == valid
+        assert _repair_escaped_structural_quotes(valid) == valid
+
+    def test_dropped_arguments_warning_carries_trace_context(self, caplog):
+        """An unrepairable drop must be correlatable: session/tool-call id + the whole string."""
+        truncated = '{"task_id": "t_0090c345", "summary": "half a summary'
+        with caplog.at_level(logging.WARNING, logger="agent.message_sanitization"):
+            result = _repair_tool_call_arguments(
+                truncated, "kanban_complete",
+                session_id="20260918_000655_2a2f52", tool_call_id="call_abc123",
+            )
+        assert result == "{}"
+        assert "Unrepairable tool_call arguments for kanban_complete" in caplog.text
+        assert "session_id=20260918_000655_2a2f52" in caplog.text
+        assert "tool_call_id=call_abc123" in caplog.text
+        assert truncated in caplog.text

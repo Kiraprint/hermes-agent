@@ -127,9 +127,116 @@ def _loads_ok(text: str) -> bool:
         return False
 
 
-def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
+# An unrepairable drop destroys the only copy of the argument string (the request proceeds
+# with ``"{}"``), so the WARNING must carry the ids that tie it back to the turn that sent
+# it — without them the log line cannot be correlated with any session or tool call.
+def _trace_context_suffix(session_id: str | None, tool_call_id: str | None) -> str:
+    """Compact ``[session_id=...; tool_call_id=...]`` suffix (known fields only)."""
+    parts = [f"{key}={value}" for key, value in (("session_id", session_id), ("tool_call_id", tool_call_id)) if value]
+    return f" [{'; '.join(parts)}]" if parts else ""
+
+
+# Bare tokens a Python ``repr``/literal emits where JSON needs ``true``/``false``/``null``.
+# Outside a string they are never valid JSON, so rewriting them is unambiguous.
+_PY_LITERALS = (("True", "true"), ("False", "false"), ("None", "null"))
+
+
+def _repair_python_literals(raw: str) -> str:
+    """Rewrite bare ``True``/``False``/``None`` tokens to their JSON literals.
+
+    String-aware: quoted content is copied verbatim, so a summary containing the word
+    ``None`` is never touched.
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if in_string:
+            if ch == "\\" and i + 1 < len(raw):
+                out.append(raw[i:i + 2])
+                i += 2
+                continue
+            in_string = ch != '"'
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        for literal, replacement in _PY_LITERALS:
+            end = i + len(literal)
+            if not raw.startswith(literal, i):
+                continue
+            if i and (raw[i - 1].isalnum() or raw[i - 1] == "_"):
+                continue
+            if end < len(raw) and (raw[end].isalnum() or raw[end] == "_"):
+                continue
+            out.append(replacement)
+            i = end
+            break
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _repair_escaped_structural_quotes(raw: str) -> str:
+    """Un-escape value delimiters sent as ``"key": \\"value\\"`` (one escape level too deep).
+
+    Outside a string a backslash is never valid JSON, so a ``\\"`` there is a mis-escaped
+    value delimiter: emit a real quote and mark the string as repaired. Only such a string
+    may end at an escaped quote — the closing ``\\"`` followed by ``,``/``}``/``]`` — so
+    ordinary escapes inside a normally-opened string are preserved. Payloads without the
+    defect come out byte-identical.
+    """
+    out: list[str] = []
+    in_string = False
+    repaired = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if in_string:
+            if ch == "\\" and i + 1 < len(raw) and raw[i + 1] == '"':
+                after = i + 2
+                while after < len(raw) and raw[after] in " \t\r\n":
+                    after += 1
+                if repaired and (after >= len(raw) or raw[after] in ",}]"):
+                    out.append('"')
+                    in_string = repaired = False
+                    i += 2
+                    continue
+                out.append('\\"')
+                i += 2
+                continue
+            if ch == '"':
+                in_string = repaired = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(raw) and raw[i + 1] == '"':
+            out.append('"')
+            in_string, repaired = True, True
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?", *, session_id: str | None = None,
+    tool_call_id: str | None = None) -> str:
     """Repair malformed tool_call argument JSON (truncation, trailing commas, Python ``None``,
-    control chars); ``"{}"`` if unrepairable so the request succeeds. Repairs log at WARNING."""
+    escaped value delimiters, control chars); ``"{}"`` if unrepairable so the request succeeds.
+    Repairs log at WARNING; ``session_id``/``tool_call_id`` are attached to the WARNING when the
+    arguments are dropped, so the drop is traceable."""
     raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
 
     if not raw_stripped:
@@ -150,8 +257,15 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
-    # Passes 1-3: strip trailing commas, close unclosed structures, trim excess closers (bounded).
-    fixed = re.sub(r',\s*([}\]])', r'\1', raw_stripped)
+    # Passes 1-2: defects the passes below cannot express — value delimiters sent one escape
+    # level too deep (``"key": \"value\"``) and Python literals (``False``/``None``). Both are
+    # string-aware, so quoted content (prose containing ``None``, real ``\"`` escapes) survives
+    # untouched and a payload without the defect is returned byte-identical.
+    fixed = _repair_escaped_structural_quotes(raw_stripped)
+    fixed = _repair_python_literals(fixed)
+
+    # Passes 3-5: strip trailing commas, close unclosed structures, trim excess closers (bounded).
+    fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
     fixed += '}' * max(0, fixed.count('{') - fixed.count('}'))
     fixed += ']' * max(0, fixed.count('[') - fixed.count(']'))
     for _ in range(50):
@@ -160,13 +274,13 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
             or (fixed.endswith(']') and fixed.count(']') > fixed.count('['))
         ):
             break
-        fixed = fixed[:-1]
+        fixed = fixed[:-1].rstrip()
 
     if _loads_ok(fixed):
         logger.warning("Repaired malformed tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], fixed[:80])
         return fixed
 
-    # Pass 4: escape control chars inside strings (strict=False alone fails when other
+    # Pass 6: escape control chars inside strings (strict=False alone fails when other
     # malformations are present too), then retry.
     escaped = _escape_invalid_chars_in_json_strings(fixed)
     if escaped != fixed and _loads_ok(escaped):
@@ -176,8 +290,8 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         return escaped
 
     logger.warning(
-        "Unrepairable tool_call arguments for %s — replaced with empty object (was: %s)",
-        tool_name, raw_stripped[:_FULL_ARGS_LOG_BOUND],
+        "Unrepairable tool_call arguments for %s — replaced with empty object%s (was: %s)",
+        tool_name, _trace_context_suffix(session_id, tool_call_id), raw_stripped[:_FULL_ARGS_LOG_BOUND],
     )
     return "{}"
 
