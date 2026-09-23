@@ -1120,6 +1120,47 @@ def _note_target_error(job: dict, msg: str, errors: list) -> None:
     errors.append(msg)
 
 
+# Transport-level symptoms of an egress outage (timeout / TLS reset / DNS loss). Only these are
+# demoted while the target's adapter is already known to be degraded; every other send failure
+# stays an ERROR so real faults keep their signal.
+_NETWORK_FAILURE_MARKERS = (
+    "timed out", "timeout", "connection reset", "connection refused",
+    "server disconnected", "eof occurred", "network is unreachable",
+    "temporary failure in name resolution",
+)
+
+
+def _is_network_failure(err: str) -> bool:
+    """True when ``err`` reads as a transport failure rather than a platform rejection."""
+    lowered = err.lower()
+    return any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS)
+
+
+def _adapter_send_path_degraded(t: _TargetDelivery) -> bool:
+    """True when this target's live adapter reports a connected-but-unproven send path."""
+    return getattr(t.runtime_adapter, "send_path_degraded", False) is True
+
+
+def _log_standalone_failure(t: _TargetDelivery, err: str, *, exc_info: bool = False) -> None:
+    """Log a standalone-lane delivery failure at the level the failure deserves.
+
+    While the target's adapter reports ``send_path_degraded`` the send path is *already* known to
+    be unproven: the live lane warned about it one step earlier, so a transport-level standalone
+    failure is the expected consequence of that degradation, not a new fault. Logging it at ERROR
+    turns one upstream egress outage into an errors.log ERROR spike — one line per delivery
+    attempt (every 5 min for a watchdog job) — and auto-files a false error-spike ticket. The
+    failure is recorded in ``delivery_errors`` either way: the run still reports it and the
+    delivery ledger still retries it. Only the log level changes.
+    """
+    job = t.job
+    if _adapter_send_path_degraded(t) and _is_network_failure(err):
+        logger.warning(
+            "Job '%s': %s (adapter send path already degraded — expected transport failure, "
+            "kept on the run and retried)", job["id"], err)
+        return
+    logger.error("Job '%s': %s", job["id"], err, exc_info=exc_info)
+
+
 def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool) -> None:
     """Relay targets have no standalone fallback, so the log line must not promise one."""
     if is_relay:
@@ -1475,7 +1516,7 @@ def _standalone_send(
 
     def _failed(e) -> tuple[None, str]:
         msg = f"delivery to {t.where} failed: {e}"
-        logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
+        _log_standalone_failure(t, msg, exc_info=True)
         return None, msg
 
     # Interpreter finalizing (SIGTERM/restart/OOM): asyncio.run and a fresh ThreadPoolExecutor both
@@ -1527,7 +1568,7 @@ def _deliver_standalone(
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
         err = f"delivery error: {result['error']} (target {t.where})"
-        logger.error("Job '%s': %s", job["id"], err)
+        _log_standalone_failure(t, err)
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)

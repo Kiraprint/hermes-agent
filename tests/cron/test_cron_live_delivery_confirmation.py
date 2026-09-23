@@ -119,8 +119,11 @@ def _gateway_config(relay=False):
     return config
 
 
-def _adapters(relay=False):
+def _adapters(relay=False, degraded=False):
     adapter = MagicMock()
+    # ``is True``-tested by the demotion gate, so an unset MagicMock attribute never counts as
+    # degraded — only an explicit bool does.
+    adapter.send_path_degraded = degraded
     if relay:
         adapter.fronts_platform = lambda p: p == Platform.TELEGRAM
         return {Platform.RELAY: adapter}
@@ -134,11 +137,13 @@ def _record_verification(job, unverified_targets):
     RECORDED_VERIFICATION.append((job["id"], list(unverified_targets)))
 
 
-def _run(job, content, send_result, relay=False, standalone_result=None, cron_cfg=None):
+def _run(job, content, send_result, relay=False, standalone_result=None, cron_cfg=None,
+         degraded=False):
     """Drive ``_deliver_result`` over the live lane with a stubbed router.
 
     Returns ``(error, router_calls, standalone_calls)``. ``cron_cfg`` extends
     the ``cron:`` section handed to the scheduler (default: unwrapped output).
+    ``degraded`` marks the target's live adapter as ``send_path_degraded``.
     """
     loop = MagicMock()
     loop.is_running.return_value = True
@@ -174,7 +179,7 @@ def _run(job, content, send_result, relay=False, standalone_result=None, cron_cf
          patch("gateway.delivery.DeliveryRouter", return_value=router), \
          patch("tools.send_message_tool._send_to_platform", _fake_send_to_platform), \
          patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-        error = _deliver_result(job, content, adapters=_adapters(relay), loop=loop)
+        error = _deliver_result(job, content, adapters=_adapters(relay, degraded), loop=loop)
     return error, router_calls, standalone_calls
 
 
@@ -404,3 +409,80 @@ class TestUnverifiedDeliveryIsRecordedOnTheJob:
 def test_scheduler_module_exposes_the_confirmation_helper():
     """Guard the import surface the delivery block depends on."""
     assert callable(sched_delivery._confirm_adapter_delivery)
+
+
+class TestDegradedEgressFailureIsNotAnErrorSpike:
+    """A transport failure while the target's adapter already reports a degraded send path is not a
+    new fault: the live lane warned about it one step earlier. Logging the standalone fallback at
+    ERROR turned one upstream egress outage into an errors.log ERROR spike (one line per delivery
+    attempt — every 5 min for a watchdog job) and auto-filed a false error-spike ticket. The failure
+    must stay recorded on the run either way, so the delivery ledger still retries it.
+    """
+
+    # What a degraded live lane returns, and what the standalone sender then hits.
+    DEGRADED_LANE = {"success": False, "error": "send_path_degraded", "delivered": False}
+    TIMEOUT = {"error": "Telegram send failed: Timed out"}
+
+    def test_degraded_adapter_demotes_a_transport_failure(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
+            error, _, standalone_calls = _run(
+                _job(), "Watchdog alert.", self.DEGRADED_LANE,
+                standalone_result=self.TIMEOUT, degraded=True)
+
+        assert len(standalone_calls) == 1
+        assert error is not None and "Timed out" in error   # still recorded on the run
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("already degraded" in r.getMessage() for r in caplog.records)
+
+    def test_degraded_adapter_demotes_a_connection_reset_too(self, caplog):
+        """The same egress incident surfaces as a reset, not only as a timeout."""
+        with caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
+            error, _, _ = _run(
+                _job(), "Watchdog alert.", self.DEGRADED_LANE,
+                standalone_result={"error": "Connection reset by peer"}, degraded=True)
+
+        assert error is not None
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    def test_healthy_adapter_keeps_the_transport_failure_at_error(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
+            error, _, _ = _run(
+                _job(), "Watchdog alert.", self.DEGRADED_LANE,
+                standalone_result=self.TIMEOUT, degraded=False)
+
+        assert error is not None and "Timed out" in error
+        assert [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    def test_degraded_adapter_keeps_a_platform_rejection_at_error(self, caplog):
+        """A bad chat id is a real fault, degraded transport or not."""
+        with caplog.at_level(logging.DEBUG, logger="cron.scheduler"):
+            error, _, _ = _run(
+                _job(), "Watchdog alert.", self.DEGRADED_LANE,
+                standalone_result={"error": "Bad Request: chat not found"}, degraded=True)
+
+        assert error is not None and "chat not found" in error
+        assert [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+def test_degraded_gate_is_bool_strict():
+    """Only an explicit ``True`` counts: a truthy stand-in must not silence ERROR."""
+    target = MagicMock()
+    target.runtime_adapter.send_path_degraded = True
+    assert sched_delivery._adapter_send_path_degraded(target) is True
+    target.runtime_adapter.send_path_degraded = "yes"
+    assert sched_delivery._adapter_send_path_degraded(target) is False
+    target.runtime_adapter = None
+    assert sched_delivery._adapter_send_path_degraded(target) is False
+
+
+@pytest.mark.parametrize("err, expected", [
+    ("Telegram send failed: Timed out", True),
+    ("Connection reset by peer", True),
+    ("EOF occurred in violation of protocol (_ssl.c:2495)", True),
+    ("Server disconnected without sending a response", True),
+    ("Temporary failure in name resolution", True),
+    ("Bad Request: chat not found", False),
+    ("Forbidden: bot was blocked by the user", False),
+])
+def test_network_failure_markers(err, expected):
+    assert sched_delivery._is_network_failure(err) is expected
