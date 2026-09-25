@@ -103,6 +103,25 @@ _PLACEHOLDER_ENV = (
     "# Behavioral settings belong in config.yaml, not here.\n"
 )
 
+# Minimal config.yaml seeded into a fresh (non-clone) profile so the kanban
+# dispatcher stays OFF by default. A profile whose config.yaml lacks an explicit
+# ``kanban:`` section inherits DEFAULT_CONFIG's ``dispatch_in_gateway: true``,
+# which makes its gateway try to acquire the machine-global singleton dispatcher
+# lock (<kanban-root>/kanban/.dispatcher.lock) and race the default/factory
+# gateway for the same board — the helper profile did exactly that. Factory
+# dispatcher profiles opt in explicitly in their own config.
+_FRESH_PROFILE_CONFIG = (
+    "# Kanban dispatcher ownership (single-dispatcher posture):\n"
+    "# non-factory profiles must NOT hold the kanban dispatcher lock\n"
+    "# (<kanban-root>/kanban/.dispatcher.lock). Only the default/factory\n"
+    "# gateway dispatches; flip dispatch_in_gateway to true ONLY for\n"
+    "# profiles explicitly intended to be factory dispatchers.\n"
+    "_config_version: {config_version}\n"
+    "kanban:\n"
+    "  dispatch_in_gateway: false\n"
+    "  enabled: false\n"
+)
+
 
 def _non_exportable_entries(directory: str, contents: list) -> set:
     """Entries under *directory* that must never be copied out of a profile: bytecode caches,
@@ -1389,6 +1408,21 @@ def _finish_profile_layout(profile_dir: Path, *, no_skills: bool, clone_all: boo
     with contextlib.suppress(Exception):  # best-effort — don't fail profile creation over this
         from hermes_cli.default_soul import DEFAULT_SOUL_MD
         _seed_file_if_missing(profile_dir / "SOUL.md", DEFAULT_SOUL_MD)
+
+    # Seed a minimal config.yaml so a fresh profile's gateway does not inherit
+    # DEFAULT_CONFIG's ``dispatch_in_gateway: true`` and race the factory gateway
+    # for the machine-global kanban dispatcher lock (see _FRESH_PROFILE_CONFIG).
+    # Skipped when the profile already has a config: --clone/--clone-all copy one
+    # from the source, kanban section included.
+    with contextlib.suppress(Exception):  # best-effort — don't fail profile creation over this
+        from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
+        _seed_file_if_missing(
+            profile_dir / "config.yaml",
+            _FRESH_PROFILE_CONFIG.format(
+                config_version=int(_DEFAULT_CONFIG.get("_config_version", 1) or 1),
+            ),
+            0o644,
+        )
 
     # Opt-out marker read by seed_profile_skills() and `hermes update`'s all-profile sync
     # (the feature still works via the empty skills/ dir if this fails).

@@ -17,9 +17,18 @@ from typing import Any, Optional
 
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
+    _dispatcher_eligible_profiles,
+    _dispatcher_holder_should_step_down,
+    _dispatcher_holder_stealable,
+    _dispatcher_lease_identity,
+    _dispatcher_lease_profile,
+    _dispatcher_profile_eligible,
+    _dispatcher_takeover_challenge,
     _kanban_dispatch_allowed,
+    _read_dispatcher_lease,
     _release_singleton_lock,
     _resolve_auto_decompose_settings,
+    _write_dispatcher_lease,
     _gc_retention_days,
     _to_thread_process_service,
     logger,
@@ -44,9 +53,22 @@ class GatewayKanbanWatchersMixin:
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
 
     def _release_kanban_dispatcher_lock(self) -> None:
-        """Clear notifier-visible ownership before releasing the OS lock."""
+        """Clear notifier-visible ownership before releasing the OS lock.
+
+        Also truncates the lease record out of the lock file so a
+        contender reading it after the release does not see a stale
+        owner identity (the flock itself is what matters for exclusion,
+        but a lingering record would mislead the takeover diagnostics).
+        """
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
+        if handle is not None:
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.flush()
+            except OSError:
+                pass
         _release_singleton_lock(handle)
 
     async def _sleep_between_ticks(self, interval: float) -> None:
@@ -200,12 +222,16 @@ class GatewayKanbanWatchersMixin:
             except Exception as exc:
                 logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
 
-    def _kanban_dispatcher_boot(self) -> Optional[tuple]:
+    async def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
 
         Config is read once at boot (restart to apply), except the auto-decompose
         toggle which is re-read every tick. The env var is an escape hatch to
-        disable without editing YAML.
+        disable without editing YAML. A contended singleton lock does not end the
+        boot: this gateway stands by and retries the takeover on
+        ``kanban.lock_takeover_interval`` (hence the coroutine), so a dead
+        dispatcher-gateway is replaced instead of starving the board until the
+        next container restart.
         """
         try:
             from hermes_cli.config import load_config as _load_config
@@ -231,21 +257,118 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return None
 
+        # Dispatch-eligibility gate (t_77f0d093): only profiles explicitly
+        # allowed by kanban.dispatcher_lock_profiles (default ["default"]) may
+        # even attempt the lock. Factory worker profiles (dev/lead/qa/reviewer),
+        # helpers, and freshly created profiles must NOT race for it — a
+        # misconfigured worker gateway that flips dispatch_in_gateway on
+        # would otherwise steal the lock from the main gateway and starve
+        # the board (incident 2026-08-13: helper held the lock for hours).
+        _self_profile = _dispatcher_lease_profile()
+        if not _dispatcher_profile_eligible(_self_profile, kanban_cfg):
+            logger.info(
+                "kanban dispatcher: profile %r is not a dispatch profile "
+                "(kanban.dispatcher_lock_profiles=%r); this gateway will NOT "
+                "dispatch and does not touch the singleton lock.",
+                _self_profile, _dispatcher_eligible_profiles(kanban_cfg),
+            )
+            return None
+
         # Single-dispatcher backstop (see _acquire_singleton_lock). The lock
         # lives at the machine-global kanban root, so it serialises ALL gateways.
         self._kanban_dispatcher_lock_handle = None
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+        self._kanban_dispatcher_lock_path = _lock_path
+        try:
+            _takeover_interval = float(
+                kanban_cfg.get("lock_takeover_interval", 30) or 30
+            )
+        except (TypeError, ValueError):
+            _takeover_interval = 30.0
+        _takeover_interval = max(_takeover_interval, 5.0)  # sanity floor
+        try:
+            _lease_timeout = float(kanban_cfg.get("lock_lease_timeout", 120) or 120)
+        except (TypeError, ValueError):
+            _lease_timeout = 120.0
+        _lease_timeout = max(_lease_timeout, 10.0)
+
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
-            logger.info("kanban dispatcher: another gateway already holds the dispatcher "
-                        "lock (%s); this gateway will NOT dispatch.", _lock_path)
-            return None
+            # Durable takeover (t_fb4a7ca4, t_77f0d093): the flock is
+            # released the moment the owner process dies, but a gateway
+            # that found the lock contended at boot must not give up
+            # forever. Re-check every kanban.lock_takeover_interval so a
+            # dead dispatcher-gateway is replaced within ~a minute, and
+            # use the lease record to detect a wedged owner or a
+            # misconfigured non-dispatch holder.
+            logger.info(
+                "kanban dispatcher: another gateway holds the dispatcher "
+                "lock (%s); standing by, will retry takeover every %.0fs "
+                "(lease timeout %.0fs)",
+                _lock_path, _takeover_interval, _lease_timeout,
+            )
+            _wedged_warned_at = 0.0
+            while _lock_state == "contended" and self._running:
+                _lease = _read_dispatcher_lease(_lock_path)
+                _verdict = _dispatcher_holder_stealable(_lease, kanban_cfg)
+                if _verdict == "dead":
+                    logger.info(
+                        "kanban dispatcher: lock holder pid=%s is dead; "
+                        "retrying takeover",
+                        _lease.get("pid"),
+                    )
+                elif _verdict == "non_factory":
+                    logger.warning(
+                        "kanban dispatcher: lock holder profile %r is not "
+                        "allowed to dispatch; writing takeover challenge "
+                        "and retrying",
+                        _lease.get("profile"),
+                    )
+                    _dispatcher_takeover_challenge(
+                        _lock_path, _verdict, _self_profile,
+                    )
+                elif _verdict == "stale":
+                    _now = time.monotonic()
+                    if _now - _wedged_warned_at >= 300:  # rate-limit
+                        _wedged_warned_at = _now
+                        logger.warning(
+                            "kanban dispatcher: lock holder pid=%s has a "
+                            "stale lease heartbeat (last %s); the dispatcher "
+                            "loop is wedged but the process is alive, so the "
+                            "flock cannot be stolen. Restart the holder "
+                            "gateway, or it will recover on its own once the "
+                            "process exits.",
+                            _lease.get("pid"), _lease.get("heartbeat_at"),
+                        )
+                _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+                if _lock_state == "contended":
+                    _slept = 0.0
+                    while _slept < _takeover_interval and self._running:
+                        await asyncio.sleep(min(0.5, _takeover_interval - _slept))
+                        _slept += 0.5
         if _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
-        else:
+            self._kanban_dispatcher_lease_profile = _self_profile
+            self._kanban_dispatcher_lease_started_at = int(time.time())
+            _write_dispatcher_lease(_lock_handle, _dispatcher_lease_identity(self))
+            logger.info(
+                "kanban dispatcher: holding singleton dispatcher lock (%s) "
+                "as profile %r",
+                _lock_path, _self_profile,
+            )
+        elif _lock_state == "unavailable":
             logger.warning("kanban dispatcher: advisory lock unavailable at %s; proceeding "
                            "on config control alone.", _lock_path)
+        else:
+            # Still contended: the gateway is shutting down while waiting
+            # for the takeover retry (self._running flipped False), or the
+            # lock never became available. Do not fall through into the
+            # dispatch loop without the lock.
+            logger.info(
+                "kanban dispatcher: lock %s still contended; not dispatching",
+                _lock_path,
+            )
+            return None
         return _load_config, _kb, kanban_cfg
 
     async def _kanban_dispatcher_watcher(self) -> None:
@@ -257,10 +380,15 @@ class GatewayKanbanWatchersMixin:
         failure never stops the next. Shutdown: ``self._running`` is checked
         between ticks and the in-flight ``to_thread`` returns on its own.
         """
-        boot = self._kanban_dispatcher_boot()
+        boot = await self._kanban_dispatcher_boot()
         if boot is None:
             return
         _load_config, _kb, kanban_cfg = boot
+        # Lock identity resolved at boot (argv profile + the machine-global lock
+        # path); the per-tick holder recheck below reads them back off ``self``
+        # instead of re-deriving them on every tick.
+        _self_profile = getattr(self, "_kanban_dispatcher_lease_profile", "default")
+        _lock_path = getattr(self, "_kanban_dispatcher_lock_path", "")
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
         interval = settings.interval
 
@@ -277,6 +405,53 @@ class GatewayKanbanWatchersMixin:
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
+            # Holder-side periodic recheck (t_77f0d093): re-read the lease
+            # every tick. If this gateway is no longer dispatch-eligible
+            # (kanban.dispatch_in_gateway flipped off, or the profile was
+            # removed from kanban.dispatcher_lock_profiles while running) or an
+            # eligible contender challenged the lease (non_factory holder),
+            # release the lock and stand down so the contender's takeover
+            # retry can acquire it. This is the holder half of "restarting
+            # a non-factory gateway no longer makes the main gateway lose
+            # the lock": a misconfigured holder self-heals within one tick.
+            if self._owns_kanban_dispatcher_lock():
+                try:
+                    _self_eligible = _dispatcher_profile_eligible(
+                        _self_profile, kanban_cfg,
+                    ) and bool(kanban_cfg.get("dispatch_in_gateway", True))
+                    _holder_lease = _read_dispatcher_lease(_lock_path)
+                    _challenge = _holder_lease.get("challenge") or {}
+                    _challenger = (
+                        _challenge.get("by") if isinstance(_challenge, dict) else None
+                    )
+                    _challenger_eligible = (
+                        isinstance(_challenger, str)
+                        and _dispatcher_profile_eligible(_challenger, kanban_cfg)
+                    )
+                    if _dispatcher_holder_should_step_down(
+                        _holder_lease, _self_eligible, _challenger_eligible,
+                    ):
+                        _why = (
+                            "profile no longer dispatch-eligible"
+                            if not _self_eligible
+                            else "takeover challenge from "
+                            + str((_holder_lease.get("challenge") or {}).get("by"))
+                        )
+                        logger.warning(
+                            "kanban dispatcher: %s; releasing singleton "
+                            "dispatcher lock and standing down",
+                            _why,
+                        )
+                        self._release_kanban_dispatcher_lock()
+                        return
+                    _write_dispatcher_lease(
+                        self._kanban_dispatcher_lock_handle,
+                        _dispatcher_lease_identity(self),
+                    )
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: holder lease recheck failed",
+                    )
             try:
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.

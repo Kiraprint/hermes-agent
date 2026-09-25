@@ -953,12 +953,18 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     import sqlite3
 
     from gateway.run import GatewayRunner
+    import gateway.kanban_watchers as _kw
     import hermes_cli.config as _cfg_mod
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
+    # The dispatcher runs as the default-profile gateway (kanban.
+    # dispatcher_lock_profiles defaults to ["default"]); pin the identity so
+    # the eligibility gate (t_77f0d093) does not reject the test process's
+    # own profile (e.g. a factory worker running pytest).
+    monkeypatch.setattr(_kw, "_dispatcher_lease_profile", lambda: "default")
     corrupt_db = tmp_path / "kanban.db"
     corrupt_db.write_text("not sqlite", encoding="utf-8")
 

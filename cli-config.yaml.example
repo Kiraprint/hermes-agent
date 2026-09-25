@@ -384,7 +384,22 @@ model:
 # is spawned with the bundled sdlc-review skill and can approve, request changes
 # back to the original implementer, or escalate a genuine external blocker.
 # Disable this only when every review is performed manually from the dashboard.
+#
+# Single-dispatcher posture: ONLY ONE gateway may run the kanban dispatcher
+# (kanban.dispatch_in_gateway: true) and hold the singleton dispatcher lock
+# (<kanban-root>/kanban/.dispatcher.lock). Every OTHER profile — especially
+# non-factory helper profiles and freshly created profiles — must keep the
+# dispatcher OFF. As a code-side backstop, only profiles named in
+# kanban.dispatcher_lock_profiles (default ["default"]) may even attempt the
+# lock; contenders re-check it every kanban.lock_takeover_interval (default 30s)
+# so a dead dispatcher-gateway is replaced within ~a minute, and treat a
+# heartbeat older than kanban.lock_lease_timeout (default 120s) as a wedged
+# holder. NOTE: kanban.dispatch_profiles is a DIFFERENT, unrelated upstream key
+# (this home's task-claim allowlist, fail-closed when present) — never use it
+# to control dispatcher-lock eligibility.
 kanban:
+  dispatch_in_gateway: false   # non-factory profiles must NEVER dispatch
+  enabled: false               # mirror the same posture for the kanban toolset
   review_dispatch: true
 
 # =============================================================================
