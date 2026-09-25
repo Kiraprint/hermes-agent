@@ -2871,6 +2871,45 @@ DEFAULT_CONFIG = {
         # so stale rows don't accumulate and get scanned on every notifier
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
+        # Silent-stall escalation. The dispatcher already logs a warning when
+        # its ready queue is non-empty but it spawns nothing; that warning is
+        # invisible unless someone tails errors.log, and an observed incident
+        # went ~21 h unnoticed (one ready task held by the respawn guard).
+        # Past the thresholds below the stall becomes operator-visible three
+        # ways: a `kanban_dispatcher` entry with needs_attention=true in
+        # gateway_state.json (shown by `hermes status`), a deduped chat alert,
+        # and an idempotent self-healing kanban ticket on the stalled board.
+        "stuck_escalation": {
+            # Master switch. Re-read every tick, so turning it off takes
+            # effect without a gateway restart.
+            "enabled": True,
+            # Consecutive ticks with spawnable ready work and 0 spawns.
+            # ~20 ticks at the default 60 s interval ≈ 20 min.
+            "stalled_ticks": 20,
+            # OR-ed with the tick signal: how long a single task may sit held
+            # by the respawn guard before the age signal fires on its own.
+            # Long "legitimate" holds (a PR waiting on a human) are exactly
+            # what the incident was made of, so they escalate too.
+            "ready_age_seconds": 21600,
+            # Minimum gap between two chat alerts for the same stall, so a
+            # stall that lasts all night does not spam the operator.
+            "alert_interval_seconds": 7200,
+            # DEBUG-free warning threshold: the first tick a hold crosses this
+            # age, one WARNING is logged (no alert, no ticket, no status
+            # change) so an operator tailing the log sees it brewing.
+            "warn_age_seconds": 3600,
+            # "<platform>:<chat_id>[:<thread_id>]", e.g. "telegram:477467153".
+            # Empty falls back to the connected home channel(s).
+            "alert_target": "",
+            # Open the self-healing ticket on the stalled board. Set false to
+            # keep alert + needs_attention without board churn.
+            "auto_ticket": True,
+            # Profile the ticket is assigned to. Empty leaves it unassigned;
+            # the board's kanban.default_assignee still applies.
+            "auto_ticket_assignee": "",
+            # Dispatcher tiebreaker for the self-healing ticket.
+            "priority": 1,
+        },
     },
 
     # Bot Mode cross-connection relay (tools/bot_relay.py). Envelopes queued

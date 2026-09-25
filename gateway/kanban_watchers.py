@@ -23,6 +23,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from gateway.kanban_stuck_escalation import StuckEscalator
+from gateway.kanban_stuck_escalation import clear_status as _clear_stuck_status
+from gateway.kanban_stuck_escalation import parse_alert_target as _parse_stuck_alert_target
+from gateway.kanban_stuck_escalation import resolve_settings as _resolve_stuck_settings
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -1859,6 +1863,153 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        # Silent-stall escalation (kanban.stuck_escalation). The warning
+        # above only reaches someone tailing errors.log; an observed incident
+        # left the whole factory board parked ~21 h with nobody told. The
+        # escalator turns the same stall into needs_attention + a deduped
+        # chat alert + an idempotent self-healing ticket. One escalator per
+        # board: holds are tracked per board, and each board's ticket lands on
+        # its own DB.
+        escalators: dict[str, "StuckEscalator"] = {}
+        # ``(task_id, reason)`` the respawn guard reported on the tick just
+        # finished, harvested here and consumed by the escalation below.
+        guard_reasons_by_board: dict[str, dict[str, str]] = {}
+        # True while the previous tick counted as stalled, so recovery is
+        # detectable without re-probing every board.
+        stalled_last_tick = False
+
+        def _held_ready_by_board() -> dict[str, list[str]]:
+            """Ready+assigned+unclaimed task ids per board, i.e. what the guard holds.
+
+            Deliberately mirrors :func:`_ready_nonempty`: same board
+            enumeration, same "assignee maps to a real Hermes profile" filter
+            (so a queue of control-plane lanes waiting on ``claim_task`` is
+            still "correctly idle", never a stall), and the same review-lane
+            gate — so escalation can only fire on a stall the existing health
+            warning already recognizes. ``claim_lock IS NULL`` is what makes a
+            row *held* rather than merely pending: a claimed row is being
+            worked right now.
+            """
+            from hermes_cli.kanban_db_connect import connect
+            from hermes_cli.kanban_db_dispatch import (
+                _profile_exists_fn,
+                review_dispatch_enabled,
+            )
+
+            statuses = ["ready"] + (["review"] if review_dispatch_enabled() else [])
+            placeholders = ",".join("?" for _ in statuses)
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            out: dict[str, list[str]] = {}
+            profile_exists = _profile_exists_fn()
+            for b in boards:
+                slug = b.get("slug") or _kb.DEFAULT_BOARD
+                conn = None
+                try:
+                    conn = connect(board=slug)
+                    rows = conn.execute(
+                        f"SELECT id, assignee FROM tasks WHERE status IN ({placeholders}) "
+                        "AND assignee IS NOT NULL AND claim_lock IS NULL "
+                        "ORDER BY created_at ASC",
+                        tuple(statuses),
+                    ).fetchall()
+                except Exception:
+                    logger.debug(
+                        "kanban stuck escalation: cannot read held tasks on %s",
+                        slug, exc_info=True,
+                    )
+                    continue
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                held = [
+                    row["id"] for row in rows
+                    if profile_exists is None or profile_exists(row["assignee"])
+                ]
+                if held:
+                    out[slug] = held
+            return out
+
+        async def _stuck_alert_sender(evidence: dict[str, Any], text: str) -> bool:
+            """Deliver one stall alert to ``alert_target``, else the home channel(s)."""
+            from gateway.config import Platform as _Platform
+
+            settings = _resolve_stuck_settings(_load_config)
+            parsed = _parse_stuck_alert_target(settings.alert_target)
+            targets: list[tuple[_Platform, str, str]] = []
+            if parsed:
+                try:
+                    targets.append((_Platform(parsed[0]), parsed[1], parsed[2]))
+                except ValueError:
+                    logger.warning(
+                        "kanban stuck escalation: unknown alert_target platform %r; "
+                        "falling back to home channel", parsed[0],
+                    )
+            else:
+                for platform in list(self.adapters.keys()):
+                    home = self.config.get_home_channel(platform)
+                    if home is not None and home.chat_id:
+                        targets.append((platform, str(home.chat_id), ""))
+            if not targets:
+                logger.debug("kanban stuck escalation: no alert target connected; skipping alert")
+                return False
+            for platform, chat_id, thread_id in targets:
+                adapter = self._authorization_adapter(platform, None)
+                if adapter is None:
+                    logger.debug(
+                        "kanban stuck escalation: no adapter for %s; skipping alert",
+                        platform.value,
+                    )
+                    continue
+                metadata = {"thread_id": thread_id} if thread_id else None
+                result = await adapter.send(chat_id, text, metadata=metadata)
+                # Same contract as the notifier send above: a push-capable
+                # adapter reports a genuine transient failure as
+                # SendResult(success=False), while adapters returning None keep
+                # the legacy "no exception == delivered" behaviour.
+                if getattr(result, "success", True) is False:
+                    logger.warning(
+                        "kanban stuck escalation: alert to %s:%s failed: %s",
+                        platform.value, chat_id,
+                        getattr(result, "error", None) or "unknown error",
+                    )
+                    return False
+            return True
+
+        async def _stuck_ticket_creator(payload: dict[str, Any]) -> str:
+            """Open the self-healing ticket on the board that stalled."""
+            from hermes_cli.kanban_db_connect import connect
+
+            board = payload["board"]
+            conn = None
+            try:
+                conn = connect(board=board)
+                return _kb.create_task(
+                    conn,
+                    title=payload["title"],
+                    body=payload["body"],
+                    assignee=payload.get("assignee") or None,
+                    priority=int(payload.get("priority") or 0),
+                    idempotency_key=payload.get("idempotency_key"),
+                    board=board,
+                    # "running" is the create_task input vocabulary
+                    # (VALID_INITIAL_STATUSES = {blocked, running}); it
+                    # resolves to a `ready` row with no parents, so the
+                    # dispatcher picks the self-healing card up next pass.
+                    # "ready" is rejected here by create_task's validation.
+                    initial_status="running",
+                )
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -2231,6 +2382,14 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
+                        # The guard already reports WHY each ready task was not
+                        # spawned (`active_pr`, `recent_success`, …). That is the
+                        # evidence the escalation ticket carries, and it rides
+                        # along on this tick's result at no extra cost.
+                        for _task_id, _reason in (
+                            getattr(res, "respawn_guarded", None) or ()
+                        ):
+                            guard_reasons_by_board.setdefault(slug, {})[_task_id] = _reason
                     # Health telemetry (aggregate across boards)
                     ready_pending = await _to_thread_process_service(_ready_nonempty)
                     if ready_pending and not any_spawned:
@@ -2248,6 +2407,63 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+
+                # Silent-stall escalation. The warning above only reaches
+                # someone tailing errors.log; an observed incident left a whole
+                # board parked ~21 h with nobody told. Here the same stall
+                # raises needs_attention, one deduped chat alert, and one
+                # idempotent self-healing ticket. Wrapped whole: a bug here must
+                # never take the dispatcher loop down with it.
+                try:
+                    guard_reasons = guard_reasons_by_board
+                    guard_reasons_by_board = {}
+                    _settings = _resolve_stuck_settings(_load_config)
+                    held_by_board: dict[str, list[str]] = {}
+                    if bad_ticks > 0:
+                        held_by_board = (
+                            await _to_thread_process_service(_held_ready_by_board)
+                        )
+                    for slug in {*held_by_board, *guard_reasons}:
+                        escalator = escalators.get(slug)
+                        if escalator is None:
+                            escalator = escalators[slug] = StuckEscalator(
+                                slug,
+                                _settings,
+                                send_alert=_stuck_alert_sender,
+                                create_ticket=_stuck_ticket_creator,
+                            )
+                        else:
+                            # resolve_settings is re-read every tick so that
+                            # `enabled: false` / a new threshold takes effect
+                            # without a gateway restart; an escalator built on
+                            # an earlier tick would otherwise pin the old
+                            # values for the life of the process.
+                            escalator.settings = _settings
+                        held = held_by_board.get(slug) or []
+                        evidence = escalator.evaluate(held, bad_ticks)
+                        if evidence:
+                            evidence["guard_reasons"] = guard_reasons.get(slug, {})
+                            outcome = await escalator.escalate(evidence)
+                            logger.warning(
+                                "kanban dispatcher [%s] escalated a silent stall: "
+                                "reason=%s bad_ticks=%d held=%d needs_attention=%s "
+                                "alert=%s ticket=%s",
+                                slug,
+                                evidence["reason"],
+                                evidence["bad_ticks"],
+                                len(held),
+                                outcome["status"] == "sent",
+                                outcome["alert"],
+                                outcome["ticket"],
+                            )
+                    if bad_ticks == 0 and stalled_last_tick:
+                        # Recovered — the dispatcher spawns again, so drop the
+                        # flag instead of leaving `hermes status` shouting about
+                        # a stall that is over.
+                        _clear_stuck_status()
+                    stalled_last_tick = bad_ticks > 0
+                except Exception:
+                    logger.exception("kanban dispatcher: stuck escalation failed")
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()
