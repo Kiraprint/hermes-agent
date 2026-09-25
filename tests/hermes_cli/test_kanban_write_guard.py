@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+import importlib
+import sys
+
 import pytest
 
 from hermes_cli import kanban_db
-from hermes_cli import kanban_db_connect as kbc
+
+
+def _live_kdbc():
+    """The ``kanban_db_connect`` module the guard actually patches.
+
+    A module-level ``from hermes_cli import kanban_db_connect`` binds ONE
+    module object, but the isolation fixtures reload that module during a
+    session, leaving the local binding pointing at a stale object that
+    ``sys.modules`` no longer holds. The guard patches whatever
+    ``sys.modules[...]`` returns, so calling the stale binding's ``connect``
+    silently bypasses the guard entirely — which is why these assertions
+    passed in isolation and failed inside a full run. Resolve dynamically.
+    """
+    return sys.modules.get("hermes_cli.kanban_db_connect") or importlib.import_module(
+        "hermes_cli.kanban_db_connect"
+    )
 
 
 def test_connect_succeeds_under_test_home(tmp_path, monkeypatch):
@@ -13,7 +31,7 @@ def test_connect_succeeds_under_test_home(tmp_path, monkeypatch):
     home = tmp_path / "hermes_home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    conn = kbc.connect()
+    conn = _live_kdbc().connect()
     try:
         assert str(kanban_db.kanban_db_path()).startswith(str(home))
     finally:
@@ -24,25 +42,27 @@ def test_connect_raises_when_kanban_home_is_real_root(monkeypatch):
     """When kanban paths resolve to the REAL root, connect raises RuntimeError."""
     import tests.conftest as _conftest
 
-    monkeypatch.setattr(
-        kanban_db, "kanban_home", lambda: _conftest._REAL_KANBAN_ROOTS[0]
+    # Same stale-binding trap as _live_kdbc(): the guard's closure holds the
+    # module object from sys.modules, so the resolver it calls has to be
+    # patched on THAT object, not on whatever this file imported at collection.
+    kdb = sys.modules.get("hermes_cli.kanban_db") or importlib.import_module(
+        "hermes_cli.kanban_db"
     )
-    monkeypatch.setattr(
-        kanban_db,
-        "kanban_db_path",
-        lambda board=None: _conftest._REAL_KANBAN_ROOTS[0] / "kanban.db",
-    )
+    real = _conftest._REAL_KANBAN_ROOTS[0]
+    monkeypatch.setattr(kdb, "kanban_home", lambda: real)
+    monkeypatch.setattr(kdb, "kanban_db_path", lambda board=None: real / "kanban.db")
     with pytest.raises(RuntimeError, match="kanban_write_guard"):
-        kbc.connect()
+        _live_kdbc().connect()
 
 
 def test_connect_raises_for_explicit_db_path_under_real_root():
     """Explicit db_path pointing under the real root is also refused."""
     import tests.conftest as _conftest
 
+    kdbc = _live_kdbc()
     for root in _conftest._REAL_KANBAN_ROOTS:
         with pytest.raises(RuntimeError, match="kanban_write_guard"):
-            kbc.connect(root / "kanban.db")
+            kdbc.connect(root / "kanban.db")
 
 
 def test_connect_raises_when_deny_list_is_empty(monkeypatch):
@@ -51,7 +71,7 @@ def test_connect_raises_when_deny_list_is_empty(monkeypatch):
 
     monkeypatch.setattr(_conftest, "_REAL_KANBAN_ROOTS", ())
     with pytest.raises(RuntimeError, match="kanban_write_guard"):
-        kbc.connect()
+        _live_kdbc().connect()
 
 
 def test_pinned_kanban_db_env_is_in_deny_list(monkeypatch, tmp_path):
