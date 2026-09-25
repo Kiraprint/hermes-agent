@@ -136,6 +136,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.cap_reason:
+        # Explain a zero-spawn tick so an operator running `dispatch` by hand
+        # doesn't read it as a failure (t_9f8cadfb).
+        print(
+            f"At concurrency cap: {res.cap_reason} "
+            f"({res.cap_running}/{res.cap_limit} workers in flight) — "
+            f"queued work spawns as running tasks complete, nothing is stuck."
+        )
     return 0
 
 
@@ -184,7 +192,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # nothing (broken profile, PATH drift, missing venv, credential loss) —
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
-    health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    health_state = {"bad_ticks": 0, "last_warn_at": 0, "last_cap_log_at": 0}
 
     def _ready_queue_nonempty() -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
@@ -197,10 +205,26 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
+        # At a concurrency cap the ready queue is non-empty and nothing
+        # spawns BY DESIGN — the board is busy, not stuck. Counting those
+        # ticks as "bad" produced false stuck warnings for hours on a
+        # saturated board (t_9f8cadfb).
+        cap_busy = kbd.dispatch_cap_busy(res)
+        if ready_pending and not res.spawned and not cap_busy:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
+        if cap_busy and ready_pending:
+            now = int(time.time())
+            if now - health_state["last_cap_log_at"] >= 300:
+                print(
+                    f"[{_fmt_ts(now)}] INFO dispatcher busy at concurrency cap: "
+                    f"{res.cap_reason} reached ({res.cap_running}/{res.cap_limit}); "
+                    f"queued work spawns as running tasks complete — not a stuck "
+                    f"dispatcher.",
+                    file=sys.stderr, flush=True,
+                )
+                health_state["last_cap_log_at"] = now
         # Warn once per HEALTH_WINDOW bad ticks, at most every 5 minutes.
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())

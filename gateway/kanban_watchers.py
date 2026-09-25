@@ -1859,6 +1859,10 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        # At-cap ("busy, not stuck") state is a steady condition, so it is
+        # rate-limited to one INFO line per 5 min, mirroring the stuck
+        # warning's own throttle.
+        last_cap_log_at = 0
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -2215,8 +2219,26 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
+                    any_cap_busy = False
+                    cap_notes: list[str] = []
                     for slug, res in (results or []):
-                        if res is not None and getattr(res, "spawned", None):
+                        if res is None:
+                            continue
+                        # Concurrency caps make a non-empty ready queue a
+                        # NORMAL steady state, not a fault: the dispatcher
+                        # correctly refuses to spawn while every worker slot
+                        # is filled, and the backlog drains as tasks finish.
+                        # Counting those ticks as "bad" produced hours-long
+                        # false "dispatcher stuck" warnings on a saturated
+                        # board (t_9f8cadfb) — which in turn triggered bogus
+                        # incident escalations.
+                        if _kb.dispatch_cap_busy(res):
+                            any_cap_busy = True
+                            cap_notes.append(
+                                f"{slug}: {res.cap_reason} "
+                                f"({res.cap_running}/{res.cap_limit})"
+                            )
+                        elif getattr(res, "spawned", None):
                             any_spawned = True
                             # Quiet by default — only log when something actually
                             # happened, so an idle gateway stays silent.
@@ -2233,10 +2255,24 @@ class GatewayKanbanWatchersMixin:
                             )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await _to_thread_process_service(_ready_nonempty)
-                    if ready_pending and not any_spawned:
+                    if ready_pending and not any_spawned and not any_cap_busy:
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
+                    # At-cap state is logged once per 5 min at INFO (not
+                    # WARNING) so the digest can still show "busy at cap"
+                    # without an operator being paged for correct behaviour.
+                    if ready_pending and any_cap_busy:
+                        now = int(time.time())
+                        if now - last_cap_log_at >= 300:
+                            logger.info(
+                                "kanban dispatcher busy at concurrency cap: ready "
+                                "queue non-empty but all worker slots are filled "
+                                "(%s); queued work spawns as running tasks "
+                                "complete — not a stuck dispatcher.",
+                                ", ".join(cap_notes),
+                            )
+                            last_cap_log_at = now
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
