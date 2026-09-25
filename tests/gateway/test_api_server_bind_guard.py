@@ -71,19 +71,38 @@ class TestApiServerBindOccupiedPort:
              patch("gateway.platforms.api_server.web.AppRunner",
                    return_value=MagicMock(setup=AsyncMock(), cleanup=AsyncMock())), \
              patch.object(a, "_api_key_passes_startup_guard", return_value=True), \
-             patch.object(a, "_write_runtime_status_safe") as mock_status:
+             patch.object(a, "_needs_attention_on_fatal") as mock_attention:
             try:
                 await a.connect()
             except OSError:
                 pass
-            calls = [c for c in mock_status.call_args_list
-                     if c[0][0] == "api_server_port_in_use"]
-            assert calls, "expected runtime-status write for api_server_port_in_use"
-            _, kwargs = calls[0]
-            assert isinstance(kwargs, dict), f"expected kwargs dict, got {type(kwargs)}: {calls[0]}"
-            assert kwargs.get("needs_attention") is True
-            assert kwargs.get("platform_state") == "fatal"
-            assert kwargs.get("error_code") == "api_server_port_in_use"
+            mock_attention.assert_called_once_with("api_server_port_in_use")
+
+    @pytest.mark.asyncio
+    async def test_clean_reconnect_with_planned_restart_no_false_attention(
+            self, tmp_path, monkeypatch):
+        """A planned restart marker must not turn a clean reconnect into attention."""
+        import gateway.run as gateway_run
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        marker = tmp_path / ".restart_pending.json"
+        marker.write_text("{}")
+        assert gateway_run._planned_restart_notification_pending() is True
+        a = _make_adapter(port=19_842)
+        with patch("gateway.platforms.api_server.web.TCPSite",
+                   return_value=MagicMock(start=AsyncMock())), \
+             patch("gateway.platforms.api_server.web.AppRunner",
+                   return_value=MagicMock(setup=AsyncMock(), cleanup=AsyncMock())), \
+             patch.object(a, "_api_key_passes_startup_guard", return_value=True), \
+             patch.object(a, "_needs_attention_on_fatal") as mock_attention, \
+             patch.object(a, "_write_runtime_status_safe") as mock_status:
+            assert await a.connect() is True
+
+        mock_attention.assert_not_called()
+        assert all(
+            call.kwargs.get("needs_attention") is not True
+            for call in mock_status.call_args_list
+        )
+        assert marker.exists()
 
     @pytest.mark.asyncio
     async def test_health_digest_contains_port_conflict_code(self):

@@ -2054,10 +2054,14 @@ class BasePlatformAdapter(ABC):
         failure; a startup bind-failure is instantly visible and must surface
         without waiting for that timer. Mirrors _flag_reconnect_needs_attention's
         status write with platform_state="fatal" so `hermes status` / `/platform
-        list` show the red flag at connect time, not 2 h later."""
-        self._update_platform_runtime_status(
-            code, platform_state="fatal", needs_attention=True,
-            error_code=code, error_message=self._fatal_error_message,
+        list` show the red flag at connect time, not 2 h later.
+        """
+        self._write_runtime_status_safe(
+            code,
+            platform_state="fatal",
+            needs_attention=True,
+            error_code=code,
+            error_message=self._fatal_error_message,
         )
 
     def _write_runtime_status_safe(self, context: str, **kwargs) -> None:
