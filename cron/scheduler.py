@@ -474,6 +474,10 @@ SILENT_MARKER = "[SILENT]"
 # Marker used by downstream runtime guards to distinguish recoverable drift skips.
 DRIFT_SKIP_MARKER = "WARNING"
 
+# Consecutive drift-skip counter for unpinned jobs. First skip logs ERROR,
+# subsequent skips log WARNING with an increasing count. Reset on success or pin.
+_drift_skip_counter: dict[str, int] = {}
+
 
 def _is_cron_silence_response(text: str) -> bool:
     """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
