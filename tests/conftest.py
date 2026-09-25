@@ -59,6 +59,14 @@ if str(PROJECT_ROOT) not in sys.path:
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+# The board itself can be pinned OUTSIDE any hermes root, and these two are how:
+# the dispatcher injects HERMES_KANBAN_DB into every worker env, and
+# HERMES_KANBAN_BOARD redirects the resolver to a non-default board. Capturing
+# only HERMES_KANBAN_HOME missed both, so a plain ``pytest`` in a worker env
+# resolved a deny-list root that exists nowhere near the live board and every
+# write fell through to "safe" (see _capture_real_kanban_roots).
+_PRE_SANDBOX_KANBAN_DB = os.environ.get("HERMES_KANBAN_DB", "").strip()
+_PRE_SANDBOX_KANBAN_BOARD = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
 
 
 def _hermes_home_points_at_production(value: str) -> bool:
@@ -656,44 +664,145 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
 # stale autouse-set value and falsely reject hermetic tests (#69385 review).
 
 
-def _capture_real_kanban_root() -> Path:
-    """Resolve the REAL kanban root from the pre-test environment.
+def _capture_real_kanban_roots() -> tuple[Path, ...]:
+    """Resolve the REAL kanban roots from the pre-test environment.
 
     Uses the pre-sandbox environment snapshot taken at the very top of this
     file (before the session HERMES_HOME sandbox rewired the env), so the
-    deny-list keeps pointing at the operator's actual root. Mirrors
-    ``kanban_db.kanban_home()`` resolution order:
-    1. ``HERMES_KANBAN_HOME`` env var when set and non-empty
-    2. the real (pre-sandbox) Hermes root otherwise
+    deny-list keeps pointing at the operator's actual root.
+
+    A single root is not enough. ``kanban_db`` pins its DB through THREE
+    independent env vars, and any of them can move the board outside every
+    hermes root:
+
+    1. ``HERMES_KANBAN_HOME`` — pins ``kanban_home()`` outright
+    2. ``HERMES_KANBAN_DB``  — pins ``kanban_db_path()`` outright; the
+       dispatcher injects this into EVERY worker env, so it is the normal
+       state for any pytest launched from a kanban worker
+    3. ``HERMES_KANBAN_BOARD`` — selects a non-default board, i.e.
+       ``<kanban_home>/kanban/boards/<slug>/kanban.db``
+
+    Resolving only (1) left (2) and (3) unguarded: with HERMES_KANBAN_HOME
+    empty the old resolver fell through to ``Path.home() / ".hermes"`` — a
+    path that does not exist whenever HOME is a profile home — so
+    ``relative_to()`` raised and every write was classified safe.
+
+    Returns a tuple of deny-roots: the board DBs themselves (existing or not —
+    a test that CREATES one is the pollution this guard exists to stop), the
+    board DIRECTORY of an explicitly pinned DB (so ``kanban.db-wal`` /
+    ``-shm`` / ``board.json`` writes are caught too), the hermes home, and the
+    per-board DBs under ``<home>/kanban/boards/<slug>/``.
     """
-    if _PRE_SANDBOX_KANBAN_OVERRIDE:
-        return Path(_PRE_SANDBOX_KANBAN_OVERRIDE).expanduser().resolve()
+    roots: list[Path] = []
+
+    def _add(value: str, *, with_parent: bool = False) -> None:
+        if not value:
+            return
+        try:
+            resolved = Path(value).expanduser().resolve()
+        except OSError:  # pragma: no cover - unresolvable env value
+            return
+        roots.append(resolved)
+        if with_parent:
+            # The parent is the board directory: a guard that only knows the
+            # DB file would let kanban.db-wal / -shm / board.json writes
+            # through. Only ever used for an explicitly pinned DB path — NOT
+            # for the hermes home, whose parent is a whole filesystem subtree
+            # (``/opt/data``, ``/``) and would block unrelated writes.
+            roots.append(resolved.parent)
+
+    _add(_PRE_SANDBOX_KANBAN_OVERRIDE)
+    _add(_PRE_SANDBOX_KANBAN_DB, with_parent=True)
+
+    home_root: Path | None = None
     if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
         _PRE_SANDBOX_HERMES_HOME
     ):
-        # HERMES_HOME was genuinely set to a CUSTOM root before the sandbox
-        # (production-pointing values are sandboxed away above, in which case
-        # the env still holds the tempdir and the resolver would be wrong) —
-        # honor it via the normal resolver (it may be a profile dir whose
-        # root matters).
-        from hermes_constants import get_default_hermes_root
-        return get_default_hermes_root().resolve()
-    # No pre-existing HERMES_HOME: the real root is the platform default,
-    # NOT the sandbox tempdir now sitting in the env.
-    return (Path.home() / ".hermes").resolve()
+        # HERMES_HOME was genuinely set to a CUSTOM root before the sandbox.
+        #
+        # Resolve it from the PRE-SANDBOX snapshot, never from the live env:
+        # ``get_default_hermes_root()`` reads ``os.environ["HERMES_HOME"]``,
+        # which the sandbox has already repointed at a throwaway tempdir, so
+        # calling it here returned the SANDBOX — the deny-list then described
+        # the sandbox it was supposed to defend against. Replaying the
+        # resolver's own rule against the snapshot keeps the real root.
+        custom = Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve()
+        home_root = (
+            custom.parent.parent if custom.parent.name == "profiles" else custom
+        ).resolve()
+    else:
+        # No pre-existing (or production-pointing) HERMES_HOME: the real root
+        # is the platform default, NOT the sandbox tempdir now in the env.
+        home_root = (Path.home() / ".hermes").resolve()
+
+    _add(str(home_root))
+    if home_root.is_dir() or not home_root.exists():
+        boards_root = home_root / "kanban" / "boards"
+        # The board selected by HERMES_KANBAN_BOARD is covered even when its
+        # directory does not exist YET: a test that CREATES
+        # ``<real home>/kanban/boards/<slug>/kanban.db`` is exactly the
+        # pollution this guard exists to prevent, so enumerating existing
+        # slugs alone would miss it.
+        slugs: set[str] = set()
+        if _PRE_SANDBOX_KANBAN_BOARD:
+            slugs.add(_PRE_SANDBOX_KANBAN_BOARD)
+        try:
+            slugs.update(p.name for p in boards_root.iterdir() if p.is_dir())
+        except OSError:
+            pass
+        for slug in sorted(slugs):
+            _add(str(boards_root / slug / "kanban.db"))
+
+    # Deduplicate while keeping order stable for readable failure messages.
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for root in roots:
+        if root not in seen:
+            seen.add(root)
+            unique.append(root)
+    return tuple(unique)
 
 
-_REAL_KANBAN_ROOT = _capture_real_kanban_root()
+_REAL_KANBAN_ROOTS = _capture_real_kanban_roots()
+# Back-compat alias: the first root IS the hermes/kanban home and existing
+# tests (and anyone debugging) read the singular name.
+_REAL_KANBAN_ROOT = _REAL_KANBAN_ROOTS[0] if _REAL_KANBAN_ROOTS else None
+
+
+def _is_real_kanban_target(resolved: Path) -> bool:
+    """True when ``resolved`` is a write target inside the REAL board.
+
+    A board dir that the operator has NOT created yet still has to be covered:
+    a test that creates ``<real home>/kanban/boards/x/kanban.db`` is exactly the
+    pollution this guard exists to stop. Enumerating on-disk slugs alone would
+    miss that, so board roots are matched as a prefix of the boards tree too.
+    """
+    for root in _REAL_KANBAN_ROOTS:
+        if resolved == root:
+            return True
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 @pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, monkeypatch):
     """Fail-closed guard: refuse kanban writes that target the REAL root.
 
-    Uses a **deny-list**: only blocks writes where the resolved DB path
-    (explicit ``db_path`` or ``kanban_db_path()``) lands under the real
-    ``~/.hermes`` captured at import time. Hermetic tests that legitimately
-    move HERMES_HOME to sibling tempdirs are unaffected.
+    Uses a **deny-list** of REAL kanban roots (captured at import time, before
+    any fixture rewires the environment). A list is used instead of a single
+    root because the board's location can be pinned through THREE independent
+    env vars — ``HERMES_KANBAN_HOME``, ``HERMES_KANBAN_DB`` and
+    ``HERMES_KANBAN_BOARD`` — and any one of them can land a write outside
+    every hermes root.
+
+    Fails CLOSED when the deny-list is empty: before this fix the resolver
+    could fall through to a never-resolving ``Path.home() / ".hermes"`` which
+    produced a single root that ``relative_to()`` never matched, so the guard
+    silently stopped guarding anything. An empty deny-list now raises.
 
     Only patches when ``hermes_cli.kanban_db_connect`` is *already imported*
     — a ``sys.modules`` probe, not an import — so the guard never drags the
@@ -726,17 +835,26 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
                 .expanduser()
                 .resolve()
             )
-        try:
-            resolved.relative_to(_REAL_KANBAN_ROOT)
-        except ValueError:
-            # Resolved path is NOT under the real root — safe to write.
-            return _orig_connect(db_path, *args, **kwargs)
-        raise RuntimeError(
-            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
-            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
-            f"Hermetic isolation has been bypassed — refusing to write "
-            f"to the real ~/.hermes. See #69283."
-        )
+        if not _REAL_KANBAN_ROOTS:
+            # Fail CLOSED. An empty deny-list used to be indistinguishable
+            # from "nothing to protect", and ``relative_to()`` against a
+            # never-resolved root then passed everything through — the guard
+            # silently stopped guarding. Refusing loudly is the safe default.
+            raise RuntimeError(
+                "kanban_write_guard: no REAL kanban root could be resolved from "
+                "the pre-test environment (HERMES_KANBAN_HOME / HERMES_KANBAN_DB / "
+                f"HERMES_HOME all unset or unresolvable), so the deny-list is empty "
+                f"and writes to {resolved} cannot be vetted. Refusing to write. "
+                "See #69283."
+            )
+        if _is_real_kanban_target(resolved):
+            raise RuntimeError(
+                f"kanban_write_guard: kanban DB path resolved to {resolved}, "
+                f"which is under a REAL kanban root {_REAL_KANBAN_ROOTS}. "
+                f"Hermetic isolation has been bypassed — refusing to write "
+                f"to the real board. See #69283."
+            )
+        return _orig_connect(db_path, *args, **kwargs)
 
     monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
 
