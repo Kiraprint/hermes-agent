@@ -2653,8 +2653,13 @@ class _StreamingCall(StreamingWaitMonitor):
         inference: 30s, or capped at 60s when configured."""
         cfg = get_provider_request_timeout(self.agent.provider, self.agent.model)
         base = cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
+        # Reasoning floor (t_568cd1c1): a sub-floor per-model/provider request timeout would
+        # cut a reasoning call off mid-think. These are the raw socket timeouts the streaming
+        # wire actually uses, so the floor has to be applied to ``base`` here as well.
+        from agent.reasoning_timeouts import get_reasoning_timeout
+        base = get_reasoning_timeout(self.agent.provider, self.agent.model, base, base)
         if cfg is not None:
-            return base, cfg, min(base, 60.0)
+            return base, base, min(base, 60.0)
         read = env_float("HERMES_STREAM_READ_TIMEOUT", 120.0)
         stale = self._stream_stale_timeout
         if read == 120.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):

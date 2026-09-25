@@ -530,9 +530,20 @@ class AIAgent(
 
     def _resolved_api_call_timeout(self) -> float:
         """Per-call request timeout: per-model ``timeout_seconds`` > provider ``request_timeout_seconds`` >
-        ``HERMES_API_TIMEOUT`` > 1800s."""
+        ``HERMES_API_TIMEOUT`` > 1800s, raised to the reasoning-model floor (t_568cd1c1).
+
+        The floor (600s for the ``kilo-auto`` aggregator models, 1800s for any other
+        allowlisted reasoning model — see :mod:`agent.reasoning_timeouts`) is applied
+        here, on the single value both the streaming and the non-streaming wire pass to
+        the transport, so a sub-floor operator timeout can no longer cut a reasoning
+        call off mid-think. An explicit ``0`` (timeout disabled) stays ``0``.
+        """
+        from agent.reasoning_timeouts import get_reasoning_timeout
         cfg = get_provider_request_timeout(self.provider, self.model)
-        return cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
+        if cfg is None and os.getenv("HERMES_API_TIMEOUT") is not None:
+            # Presence-checked so an explicit ``0`` (disabled) is still seen as explicit.
+            cfg = env_float("HERMES_API_TIMEOUT", 1800.0)
+        return get_reasoning_timeout(self.provider, self.model, cfg, 1800.0)
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Base non-stream stale timeout: per-model ``stale_timeout_seconds`` > provider-wide >
