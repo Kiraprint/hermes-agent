@@ -184,6 +184,48 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    cap_reason: Optional[str] = None
+    """Which concurrency cap explains a zero-spawn tick, if one does:
+    ``"max_spawn"``, ``"max_in_progress"`` or ``"max_in_progress_per_profile"``.
+    The dispatcher correctly refuses to spawn when every worker slot is
+    filled, so a non-empty ready queue at the cap is "busy", not "stuck" —
+    health telemetry must not raise the stuck warning for it (it used to,
+    which produced false "dispatcher stuck" warnings for hours whenever the
+    board simply happened to be saturated)."""
+    cap_running: int = 0
+    """Workers in flight against ``cap_reason`` when the cap was hit (for the
+    log line only; the cap may have had headroom on other profiles)."""
+    cap_limit: int = 0
+    """The cap value that was reached (``0`` = unknown/unset)."""
+
+
+def dispatch_cap_busy(result: "DispatchResult") -> bool:
+    """Is this tick's zero spawn fully explained by a concurrency cap?
+
+    True when the dispatcher was told "no free worker slots" — either the
+    host-level ``max_in_progress`` / per-board ``max_spawn`` budget returned
+    "may not spawn" (no lane was even enumerated), or every ready row the
+    tick considered was deferred by the per-profile cap. In both cases the
+    ready queue is draining normally and the board is *busy*, not *stuck*:
+    the work spawns as soon as a running task finishes.
+
+    Deliberately conservative — a tick that ALSO recorded a genuine spawn
+    fault (``auto_blocked`` / ``rate_limited`` / ``respawn_guarded`` /
+    ``skipped_unassigned`` / ``skipped_nonspawnable``) is NOT reported as
+    cap-busy, so a real dispatcher fault that happens to coincide with a
+    saturated board still surfaces in health telemetry.
+    """
+    if result is None or getattr(result, "spawned", None):
+        return False
+    cap_busy = bool(result.cap_reason) or bool(result.skipped_per_profile_capped)
+    if not cap_busy:
+        return False
+    if any((
+        result.auto_blocked, result.rate_limited, result.respawn_guarded,
+        result.skipped_unassigned, result.skipped_nonspawnable,
+    )):
+        return False
+    return True
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1739,12 +1781,21 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # Refusing to spawn because every per-board worker slot is
+            # filled. Record WHY so health telemetry can tell a saturated
+            # board ("busy") from a wedged one ("stuck").
+            result.cap_reason = "max_spawn"
+            result.cap_running = running_count
+            result.cap_limit = int(max_spawn)
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.cap_reason = "max_in_progress"
+            result.cap_running = total_running
+            result.cap_limit = int(max_in_progress)
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -1908,6 +1959,20 @@ def _dispatch_once_locked(
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
+    # Per-profile cap reached for every candidate this tick: the budget had
+    # room, but the only assignees with ready work are already at their own
+    # per-profile cap. Same "busy, not stuck" shape as the global cap above
+    # (t_9f8cadfb) — the deferral clears on the first tick where that
+    # profile has a free slot.
+    if (
+        per_profile_cap is not None
+        and not result.spawned
+        and result.skipped_per_profile_capped
+        and result.cap_reason is None
+    ):
+        result.cap_reason = "max_in_progress_per_profile"
+        result.cap_running = max(per_profile_running.values(), default=0)
+        result.cap_limit = int(per_profile_cap)
     return result
 
 

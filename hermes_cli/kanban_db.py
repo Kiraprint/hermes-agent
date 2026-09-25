@@ -4069,6 +4069,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _terminate_reclaimed_worker,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    dispatch_cap_busy,
 )
 
 
