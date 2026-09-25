@@ -79,3 +79,75 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
         if pattern.search(name):
             return float(floor)
     return None
+
+
+# ── Unified per-request timeout floor for reasoning models (t_568cd1c1) ─────────
+#
+# Reasoning / aggregator-routing calls can legitimately need minutes per call; the
+# pre-incident 300-second per-model timeout (incident t_ec7a0c1c) cut them off
+# mid-think. ``get_reasoning_timeout()`` raises any sub-floor explicit timeout up to
+# the floor. The floor is applied to reasoning-family models only, so an operator's
+# explicit per-model value for a plain model is never overridden:
+#   * Kilo-gateway auto routing (``.../kilo-auto/...``, e.g. ``custom/kilo-auto/free``
+#     / ``custom/kilo-auto/pro``) -> 600s
+#   * any other allowlisted reasoning model -> 1800s
+# Preserved rules: an explicit 0 (disabled timeout) stays 0, and a missing value
+# (None) resolves to the provider/model default chain (``default`` below).
+
+#: Kilo-gateway auto-router: its upstream idle-kill window is shorter than a full
+#: reasoning think, so its floor is lower than the universal one.
+_KILO_AUTO_REQUEST_TIMEOUT_FLOOR_SECONDS = 600.0
+#: Universal floor for any other reasoning model: a slow / queueing / thinking call
+#: must not be cut off at a sub-floor per-request timeout.
+_DEFAULT_REASONING_REQUEST_TIMEOUT_FLOOR_SECONDS = 1800.0
+
+
+def _is_kilo_auto_router(model: object) -> bool:
+    """True when *model* routes through the Kilo ``kilo-auto`` aggregator.
+
+    The Kilo auto slug appears as a ``/``-separated component of the model string
+    (``custom/kilo-auto/free``, ``kilo-auto/pro``); any component starting with
+    ``kilo-auto`` matches so future SKUs keep matching.
+    """
+    if not model or not isinstance(model, str):
+        return False
+    return any(comp.startswith("kilo-auto") for comp in model.strip().lower().split("/"))
+
+
+def get_reasoning_timeout(
+    provider: object, model: object, timeout: Optional[float],
+    default: Optional[float] = None,
+) -> float:
+    """Effective per-request timeout for *provider*/*model*, with the reasoning floor.
+
+    * ``timeout`` <= 0 (explicit off) -> ``0.0``: the floor never re-enables a
+      timeout the operator explicitly disabled.
+    * ``timeout is None`` (nothing explicitly configured) -> the provider/model
+      default: *default* when the caller supplies the resolved default chain, else
+      the built-in 1800s; a reasoning model's default is still raised to its floor.
+    * ``0 < timeout < floor`` -> the floor (never lowered); ``timeout >= floor``
+      -> unchanged.
+    Non-reasoning models carry no floor: their values are honored verbatim.
+    """
+    floor: Optional[float]
+    if _is_kilo_auto_router(model):
+        floor = _KILO_AUTO_REQUEST_TIMEOUT_FLOOR_SECONDS
+    elif get_reasoning_stale_timeout_floor(model) is not None:
+        floor = _DEFAULT_REASONING_REQUEST_TIMEOUT_FLOOR_SECONDS
+    else:
+        floor = None
+    if timeout is not None:
+        try:
+            explicit = float(timeout)
+        except (TypeError, ValueError):
+            explicit = None
+        if explicit is not None:
+            if explicit <= 0:
+                return 0.0
+            if floor is not None:
+                return max(explicit, floor)
+            return explicit
+    base = float(default) if default is not None else _DEFAULT_REASONING_REQUEST_TIMEOUT_FLOOR_SECONDS
+    if floor is not None:
+        return max(base, floor)
+    return base

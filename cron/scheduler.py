@@ -474,6 +474,16 @@ SILENT_MARKER = "[SILENT]"
 # Marker used by downstream runtime guards to distinguish recoverable drift skips.
 DRIFT_SKIP_MARKER = "WARNING"
 
+# Leading token of the error ``run_job`` returns when it refuses to run a job that holds the
+# ``terminal`` toolset without a pinned inference assignment (t_568cd1c1). Kept at the head of the
+# error string — same convention as ``BLOCKED_CONFIG_MARKER`` — so operators and downstream guards
+# can filter on it.
+DRIFT_SKIP_PREFIX = "drift_skip"
+
+# Toolset whose holder can run arbitrary commands with the gateway's own privileges. A job that
+# holds it must not inherit a (mutating) global inference assignment.
+_PRIVILEGED_CRON_TOOLSET = "terminal"
+
 
 def _is_cron_silence_response(text: str) -> bool:
     """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
@@ -1487,6 +1497,50 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
     return False, blocked_doc, "", f"{marker} {_pf_reason}"
 
 
+def unpinned_terminal_toolset_reason(job: dict) -> Optional[str]:
+    """Reason string when *job* enables the ``terminal`` toolset while pinning neither ``model``
+    nor ``provider``; ``None`` when the job is allowed to run.
+
+    A pinned inference assignment is what keeps an autonomous job's model stable across ticks. A
+    job that holds the shell without either pin silently inherits the global (mutating) assignment
+    — the combination behind the t_ec7a0c1c incident, where an unpinned job spent a whole fire on a
+    model the operator never chose for it. Jobs without ``terminal`` keep inheriting the global
+    assignment (unchanged), and ``no_agent`` jobs are exempt because they spawn no agent.
+    """
+    if job.get("no_agent"):
+        return None
+    toolsets = job.get("enabled_toolsets")
+    if not isinstance(toolsets, (list, tuple, set, frozenset)):
+        return None
+    names = {t.strip().lower() for t in toolsets if isinstance(t, str)}
+    if _PRIVILEGED_CRON_TOOLSET not in names:
+        return None
+    if str(job.get("model") or "").strip() or str(job.get("provider") or "").strip():
+        return None
+    return (
+        f"enables the '{_PRIVILEGED_CRON_TOOLSET}' toolset but pins neither 'model' nor "
+        f"'provider', so it would silently inherit the global inference assignment"
+    )
+
+
+def guard_unpinned_terminal_toolset(job: dict, job_id: str, job_name: str) -> None:
+    """Raise ``RuntimeError("drift_skip: ...")`` for an unpinned terminal-enabled job.
+
+    Called by ``run_job`` before any agent or session is spawned. The reason carries
+    :data:`DRIFT_SKIP_MARKER` so the drift-skip branch of :func:`_compose_run_delivery` suppresses
+    the per-run ping and records no incident; the job itself stays enabled and scheduled.
+    """
+    reason = unpinned_terminal_toolset_reason(job)
+    if reason is None:
+        return
+    raise RuntimeError(
+        f"{DRIFT_SKIP_PREFIX}: cron job '{job_name}' skipped before the agent was started — it "
+        f"{reason}. {DRIFT_SKIP_MARKER}: no model call was made and the job stays enabled and "
+        f"scheduled. Pin the assignment (`hermes cron edit {job_id} --model <name> "
+        f"[--provider <id>]`) or drop '{_PRIVILEGED_CRON_TOOLSET}' from the job's enabled_toolsets."
+    )
+
+
 def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[dict, str]:
     """Resolve the runtime, walking the fallback chain on auth/transient-network errors. Returns
     ``(runtime, model)``; provider+model swap atomically (never swap only the provider while keeping
@@ -2250,6 +2304,11 @@ def run_job(
     scope = _CronRunScope(job, job_id, execution_id)
     try:
         scope.enter()
+        # Refuse an unpinned terminal-enabled job BEFORE the agent/session is spawned: it would run
+        # on whatever the global assignment happens to be at this tick (t_568cd1c1). Raises a
+        # ``drift_skip:`` RuntimeError, which the handler below returns as a normal failed run
+        # (drift-skip delivery: no per-run ping, no incident, job stays enabled and scheduled).
+        guard_unpinned_terminal_toolset(job, job_id, job_name)
         if scope.workdir:
             logger.info("Job '%s': using task-scoped workdir %s", job_id, scope.workdir)
         _reload_dotenv_and_publish_delivery_target(job)
@@ -2281,7 +2340,10 @@ def run_job(
         return True, output, final_response, None
 
     except Exception as e:
-        error_msg = f"{type(e).__name__}: {str(e)}"
+        # A drift-skip refusal keeps its marker at the HEAD of the error string (same convention as
+        # ``[blocked_config]``): operators and downstream guards filter on the leading token, so it
+        # must not be buried behind a ``RuntimeError: `` prefix (t_568cd1c1).
+        error_msg = str(e) if str(e).startswith(DRIFT_SKIP_PREFIX) else f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # No audit row when we failed before the agent existed; the audit write must never raise.
         if _audit is not None:
