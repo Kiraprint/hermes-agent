@@ -34,6 +34,9 @@ _LOCAL_PATH_RE = re.compile(
     r"[A-Za-z]:\\[^\s,;]+)"
 )
 
+# Fork-sync health feed: settle before the first read so gateway startup never waits on it.
+_FORK_SYNC_HEALTH_SETTLE_SECONDS = 10.0
+
 
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
@@ -277,26 +280,34 @@ def _read_dispatcher_lease(lock_path) -> dict:
 def _lease_owner_alive(lease: dict) -> bool:
     """Best-effort liveness of the lease-recorded owner pid.
 
-    On POSIX ``os.kill(pid, 0)`` is a pure liveness probe. On Windows it is
-    NOT a no-op (sends CTRL_C to the console group — see gateway.status
-    ``_pid_exists``), so fall back to ``True``: a wedged owner on Windows is
-    only detectable via the heartbeat timeout, which is fine because the
-    flock can never be stolen from a live process anyway.
+    Delegates to :func:`gateway.status._pid_exists`, the single cross-platform
+    liveness probe: psutil first (zombies report dead, so a reaped-but-not-yet
+    parented owner does not wedge the lease), then ctypes ``OpenProcess`` on
+    Windows, then ``os.kill(pid, 0)`` on POSIX. Never call ``os.kill(pid, 0)``
+    directly here — on Windows it is NOT a no-op (it sends CTRL_C_EVENT to the
+    target's console process group, bpo-14484).
     """
     pid = lease.get("pid")
-    if not isinstance(pid, int) or pid <= 0:
+    # bool is a subclass of int — a lease record with pid=true is corrupt data,
+    # not "pid 1 owns the lease", so reject it before it reaches the probe.
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    if os.name == "nt":
-        return True
     try:
-        os.kill(pid, 0)
+        from gateway.status import _pid_exists
+    except ImportError:
+        # gateway.status unavailable (partial install): on Windows assume alive
+        # (the flock cannot be stolen from a live process anyway); elsewhere
+        # fall through to a POSIX-only probe.
+        if os.name == "nt":
+            return True
+        try:
+            os.kill(pid, 0)  # windows-footgun: ok — POSIX-only fallback branch
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
         return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
+    return bool(_pid_exists(pid))
 
 
 def _dispatcher_eligible_profiles(kanban_cfg) -> list:
@@ -1544,6 +1555,52 @@ class GatewayKanbanWatchersMixin:
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+
+    async def _fork_sync_health_watcher(self) -> None:
+        """Fork-sync divergence health feed — reports, never blocks dispatch.
+
+        Refreshes :mod:`agent.monitoring.fork_sync_health` on an interval: age of
+        the last successful fork/upstream sync, the last run's exit code, and how
+        many conflict-escalation tasks are still open on the board. Every
+        transition into degraded/unhealthy is logged as a structured WARNING
+        (bridged to the monitoring plane for ``gateway.*`` loggers), and the
+        state is readable from the readiness endpoint and the
+        ``hermes.fork_sync.*`` gauges.
+
+        Fail-open by construction: a broken log or board read is a *status*, not
+        an exception, and the loop body is wrapped again here. The dispatcher and
+        the ready queue must keep running while fork-sync is failed — that is the
+        invariant this feed reports on, so it can never be the thing that breaks
+        it.
+        """
+        from gateway.run_watchers import _interruptible_sleep
+
+        try:
+            from agent.monitoring import fork_sync_health
+            settings = fork_sync_health.resolve_fork_sync_settings()
+        except Exception as exc:
+            logger.warning("fork-sync health: settings unavailable (error_type=%s)", type(exc).__name__)
+            return
+        if not settings.enabled:
+            logger.info("fork-sync health: feed disabled via config fork_sync.enabled=false")
+            return
+
+        interval = max(30.0, float(settings.health_interval_seconds))
+        # Short settle so gateway startup never waits on the feed.
+        await asyncio.sleep(min(_FORK_SYNC_HEALTH_SETTLE_SECONDS, interval))
+        while self._running:
+            try:
+                # Off-loop: the refresh reads a log file and the board DB.
+                snapshot = await asyncio.to_thread(fork_sync_health.refresh_fork_sync_health, settings)
+                self._fork_sync_health = snapshot.state
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Belt and braces: the feed is already fail-open, so a raise here means
+                # a projection bug — still never a reason to stop dispatching.
+                logger.warning("fork-sync health: refresh failed (error_type=%s)", type(exc).__name__)
+                logger.debug("fork-sync health: refresh traceback", exc_info=True)
+            await _interruptible_sleep(self, int(interval))
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

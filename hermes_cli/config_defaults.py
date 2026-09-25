@@ -2754,6 +2754,32 @@ DEFAULT_CONFIG = {
         "media_send_timeout_seconds": 300,
     },
 
+    # Fork-sync liveness feed — the nightly fork/upstream sync runner
+    # (fork_sync_nightly.sh) writes a log contract and escalates unresolved
+    # rebase conflicts to a board task. The gateway reads both and reports
+    # healthy / degraded / unhealthy through the health endpoint and the
+    # fork-sync metrics. Read-only and fail-open: a broken read degrades the
+    # reported status and never blocks the dispatcher or the ready queue.
+    "fork_sync": {
+        # Master switch for the health feed (the runner itself is cron-owned
+        # and unaffected).
+        "enabled": True,
+        # Runner log to parse. Empty = <HERMES_HOME>/logs/fork-sync.log.
+        # $FORK_SYNC_LOG (the runner's own env var) always wins.
+        "log_path": "",
+        # Board whose open "Fork-sync конфликт" escalation tasks count as an
+        # owned conflict (degraded) instead of an unattended one (unhealthy).
+        # Empty = the current board.
+        "board": "",
+        # A successful sync older than this is stale -> degraded. Default 36h:
+        # one nightly cadence plus one missed night of grace.
+        "stale_after_seconds": 129600,
+        # Log-tail bytes parsed per read (bounded; never a whole-file read).
+        "tail_bytes": 65536,
+        # How often the gateway refreshes the feed (floor 30s).
+        "health_interval_seconds": 300,
+    },
+
     # Kanban multi-agent coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
     # (default 60), reclaims stale claims, promotes dependency-satisfied
@@ -3129,6 +3155,14 @@ DEFAULT_CONFIG = {
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
+
+        # Unexpected-signal post-interrupt grace budget (seconds) before the
+        # gateway force-exits; ``.inf``/negative are clamped by the parser.
+        # Dropped from main by the stale config_defaults.py in 6ca71dec2d, which
+        # breaks `import gateway` (gateway/restart.py reads this key at module
+        # scope) — restored here so the health/verification tests below can
+        # import the package at all.
+        "signal_interrupt_grace_timeout": 10.0,
 
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
