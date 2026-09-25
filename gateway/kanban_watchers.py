@@ -29,6 +29,28 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+# Lazy accessors to the split kanban_db modules. ``hermes_cli.kanban_db`` is a
+# plugin-compat facade for the names the Sep 2026 decomposition moved out
+# (PLUGIN-COMPAT blocks, see COMPAT_MANIFEST.md) and is removed on schedule by
+# reverting one commit, so in-tree code must not reach through it for those
+# names — scripts/check_compat_pointers.py fails CI otherwise. The facade is
+# still the only home for the base helpers (list_boards, kanban_db_path,
+# get_task, ...), which is why it stays imported locally in the callers below.
+def _kbc():
+    from hermes_cli import kanban_db_connect
+    return kanban_db_connect
+
+
+def _kbn():
+    from hermes_cli import kanban_db_notify
+    return kanban_db_notify
+
+
+def _kbd():
+    from hermes_cli import kanban_db_dispatch
+    return kanban_db_dispatch
+
+
 _LOCAL_PATH_RE = re.compile(
     r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
     r"[A-Za-z]:\\[^\s,;]+)"
@@ -682,7 +704,7 @@ class GatewayKanbanWatchersMixin:
                         # checkpoint traffic) is exactly the per-tick cost
                         # this skip avoids.
                         try:
-                            if _kb.count_notify_subs(
+                            if _kbn().count_notify_subs(
                                 board=slug,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
@@ -699,7 +721,7 @@ class GatewayKanbanWatchersMixin:
                                 slug, exc,
                             )
                         try:
-                            conn = _kb.connect(board=slug)
+                            conn = _kbc().connect(board=slug)
                         except Exception as exc:
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
@@ -712,7 +734,7 @@ class GatewayKanbanWatchersMixin:
                                 # blocks delivery; the next hourly gate
                                 # retries it.
                                 try:
-                                    _purged = _kb.purge_stale_done_notify_subs(
+                                    _purged = _kbn().purge_stale_done_notify_subs(
                                         conn,
                                         max_age_days=_gc_retention_days,
                                     )
@@ -738,7 +760,7 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
-                            subs = _kb.list_notify_subs(
+                            subs = _kbn().list_notify_subs(
                                 conn,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
@@ -763,7 +785,7 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
-                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                    old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
@@ -1396,10 +1418,9 @@ class GatewayKanbanWatchersMixin:
         ``board`` scopes the DB connection to the board that owns this
         subscription. Unsub cursors in one board can't touch another's.
         """
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
+        conn = _kbc().connect(board=board)
         try:
-            _kb.advance_notify_cursor(
+            _kbn().advance_notify_cursor(
                 conn,
                 task_id=sub["task_id"],
                 platform=sub["platform"],
@@ -1411,10 +1432,9 @@ class GatewayKanbanWatchersMixin:
             conn.close()
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
+        conn = _kbc().connect(board=board)
         try:
-            _kb.remove_notify_sub(
+            _kbn().remove_notify_sub(
                 conn,
                 task_id=sub["task_id"],
                 platform=sub["platform"],
@@ -1432,10 +1452,9 @@ class GatewayKanbanWatchersMixin:
         board: Optional[str] = None,
     ) -> None:
         """Sync helper: undo a claimed notification cursor after send failure."""
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
+        conn = _kbc().connect(board=board)
         try:
-            _kb.rewind_notify_cursor(
+            _kbn().rewind_notify_cursor(
                 conn,
                 task_id=sub["task_id"],
                 platform=sub["platform"],
@@ -1816,7 +1835,7 @@ class GatewayKanbanWatchersMixin:
         # hosted VMs has repeatedly swap-thrashed the whole machine. Explicit
         # config always wins; None stays None on hosts where total memory
         # can't be read (macOS/Windows dev machines).
-        effective_max_in_progress = _kb.resolve_max_in_progress(max_in_progress)
+        effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
         if max_in_progress is None and effective_max_in_progress is not None:
             logger.info(
                 "kanban dispatcher: kanban.max_in_progress unset; using "
@@ -1826,23 +1845,24 @@ class GatewayKanbanWatchersMixin:
             )
         max_in_progress = effective_max_in_progress
 
-        raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
+        default_failure_limit = _kbd().DEFAULT_FAILURE_LIMIT
+        raw_failure_limit = kanban_cfg.get("failure_limit", default_failure_limit)
         try:
             failure_limit = int(raw_failure_limit)
         except (TypeError, ValueError):
             logger.warning(
                 "kanban dispatcher: invalid kanban.failure_limit=%r; using default %d",
                 raw_failure_limit,
-                _kb.DEFAULT_FAILURE_LIMIT,
+                default_failure_limit,
             )
-            failure_limit = _kb.DEFAULT_FAILURE_LIMIT
+            failure_limit = default_failure_limit
         if failure_limit < 1:
             logger.warning(
                 "kanban dispatcher: kanban.failure_limit=%r is below 1; using default %d",
                 raw_failure_limit,
-                _kb.DEFAULT_FAILURE_LIMIT,
+                default_failure_limit,
             )
-            failure_limit = _kb.DEFAULT_FAILURE_LIMIT
+            failure_limit = default_failure_limit
 
         # Read stale_timeout_seconds — 0 disables stale detection.
         raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
@@ -1937,7 +1957,7 @@ class GatewayKanbanWatchersMixin:
             return (resolved, stat.st_mtime_ns, stat.st_size)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
+            corrupt_guard_error = _kbc().KanbanDbCorruptError
             if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
                 return True
             if not isinstance(exc, sqlite3.DatabaseError):
@@ -1982,14 +2002,14 @@ class GatewayKanbanWatchersMixin:
                     )
                 disabled_corrupt_boards.pop(slug, None)
             try:
-                conn = _kb.connect(board=slug)
+                conn = _kbc().connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                return _kbd().dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -2072,7 +2092,7 @@ class GatewayKanbanWatchersMixin:
             # waiting for a human, not a stuck dispatcher; probing it here would
             # fire a false "dispatcher stuck" warning that never clears. Shares
             # the exact gate the dispatcher uses so the two can't drift.
-            _review_probe = _kb.review_dispatch_enabled()
+            _review_probe = _kbd().review_dispatch_enabled()
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
@@ -2081,10 +2101,10 @@ class GatewayKanbanWatchersMixin:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
-                    conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    conn = _kbc().connect(board=slug)
+                    if _kbd().has_spawnable_ready(conn):
                         return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
+                    if _review_probe and _kbd().has_spawnable_review(conn):
                         return True
                 except Exception:
                     continue
@@ -2246,7 +2266,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
-                pids = await _to_thread_process_service(_kb.reap_worker_zombies)
+                pids = await _to_thread_process_service(_kbd().reap_worker_zombies)
                 if pids:
                     logger.info(
                         "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
