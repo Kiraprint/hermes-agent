@@ -695,24 +695,33 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     ``~/.hermes`` captured at import time. Hermetic tests that legitimately
     move HERMES_HOME to sibling tempdirs are unaffected.
 
-    Only patches when ``hermes_cli.kanban_db_connect`` is *already imported*
-    — a ``sys.modules`` probe, not an import — so the guard never drags the
-    kanban module into unrelated test processes.
+    Always imports the two kanban modules instead of probing ``sys.modules``.
+    The probe was the guard's own worst failure mode: a test that imports
+    kanban lazily (inside its body, or in a fixture that runs after this
+    one) found the module absent, so the guard returned without arming --
+    and a no-op guard is indistinguishable from a covered one. Measured on
+    this branch: with a module-level import the guard armed and refused the
+    write; with the same import moved inside the test body it armed not at
+    all and the row was written to the real board. The modules are tiny and
+    import nothing side-effecting, so importing them unconditionally is
+    strictly safer than a silent no-op.
 
     Uses ``monkeypatch.setattr`` so pytest restores ``connect`` automatically
     after each test (no stacked wrappers or state leakage across tests).
     """
-    _kdb = sys.modules.get("hermes_cli.kanban_db")
-    _kdbc = sys.modules.get("hermes_cli.kanban_db_connect")
+    try:
+        _kdb = importlib.import_module("hermes_cli.kanban_db")
+        _kdbc = importlib.import_module("hermes_cli.kanban_db_connect")
+    except Exception:  # pragma: no cover - unimportable kanban module
+        # Cannot arm. Still fail closed rather than leave the guard silently
+        # absent -- see the empty-deny-list branch in _guarded_connect.
+        _kdb = _kdbc = None
     if _kdb is None or _kdbc is None:
         return
 
-    # The sys.modules probe can observe the module MID-IMPORT: a fixture
-    # boundary firing while another test's lazy `import hermes_cli.kanban_db`
-    # is still executing sees a partially initialized module whose `connect`
-    # doesn't exist yet (AttributeError flake, caught in a full-suite run).
-    # A half-imported module has no callers yet either — nothing to guard
-    # this round; the next test's fixture will patch the completed module.
+    # Both modules are now imported by the fixture itself, so ``connect``
+    # always exists here. A half-imported module is no longer reachable:
+    # import_module() returns only after the module finishes executing.
     _orig_connect = getattr(_kdbc, "connect", None)
     if _orig_connect is None or getattr(_kdb, "kanban_db_path", None) is None:
         return
