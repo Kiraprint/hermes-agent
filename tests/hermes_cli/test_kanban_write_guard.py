@@ -51,7 +51,7 @@ def test_connect_raises_when_kanban_home_is_real_root(monkeypatch):
     real = _conftest._REAL_KANBAN_ROOTS[0]
     monkeypatch.setattr(kdb, "kanban_home", lambda: real)
     monkeypatch.setattr(kdb, "kanban_db_path", lambda board=None: real / "kanban.db")
-    with pytest.raises(RuntimeError, match="kanban_write_guard"):
+    with pytest.raises(RuntimeError, match="kanban write guard"):
         _live_kdbc().connect()
 
 
@@ -61,16 +61,23 @@ def test_connect_raises_for_explicit_db_path_under_real_root():
 
     kdbc = _live_kdbc()
     for root in _conftest._REAL_KANBAN_ROOTS:
-        with pytest.raises(RuntimeError, match="kanban_write_guard"):
+        with pytest.raises(RuntimeError, match="kanban write guard"):
             kdbc.connect(root / "kanban.db")
 
 
 def test_connect_raises_when_deny_list_is_empty(monkeypatch):
-    """When the deny-list is empty, connect raises RuntimeError."""
-    import tests.conftest as _conftest
+    """No resolvable deny-root at all -> refuse, do not wave the write through.
 
-    monkeypatch.setattr(_conftest, "_REAL_KANBAN_ROOTS", ())
-    with pytest.raises(RuntimeError, match="kanban_write_guard"):
+    The guard reads ``_ktg._KANBAN_GUARD_DENY_ROOTS`` (published by the autouse
+    conftest fixture) and falls back to the real platform ``~/.hermes``, so both
+    have to be neutralised to reach this branch. Fail-closed is the whole point:
+    an empty list used to be indistinguishable from "nothing to protect".
+    """
+    from hermes_cli import kanban_test_guard as _ktg
+
+    monkeypatch.setattr(_ktg, "_KANBAN_GUARD_DENY_ROOTS", (), raising=False)
+    monkeypatch.setattr(_ktg, "_real_platform_kanban_root", lambda: None, raising=False)
+    with pytest.raises(RuntimeError, match="FAIL-CLOSED"):
         _live_kdbc().connect()
 
 

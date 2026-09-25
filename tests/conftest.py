@@ -789,74 +789,40 @@ def _is_real_kanban_target(resolved: Path) -> bool:
 
 
 @pytest.fixture(autouse=True)
-def _kanban_write_guard(_hermetic_environment, monkeypatch):
-    """Fail-closed guard: refuse kanban writes that target the REAL root.
+def _kanban_write_guard(_hermetic_environment, monkeypatch, request):
+    """Hand the REAL kanban deny-roots to the guard that lives in production code.
 
-    Uses a **deny-list** of REAL kanban roots (captured at import time, before
-    any fixture rewires the environment). A list is used instead of a single
-    root because the board's location can be pinned through THREE independent
-    env vars — ``HERMES_KANBAN_HOME``, ``HERMES_KANBAN_DB`` and
-    ``HERMES_KANBAN_BOARD`` — and any one of them can land a write outside
-    every hermes root.
+    ENFORCEMENT IS NOT HERE ANYMORE, AND THAT IS THE POINT. This fixture only
+    supplies the roots, because only the conftest can see the **pre-sandbox**
+    environment: ``_hermetic_environment`` deletes HERMES_KANBAN_DB /
+    HERMES_KANBAN_BOARD / HERMES_KANBAN_HOME before any test body runs, so by
+    connect() time the real pin is already gone from ``os.environ`` and the
+    guard could not rediscover it by itself. Publishing the roots captured at
+    import time into ``hermes_cli.kanban_test_guard._KANBAN_GUARD_DENY_ROOTS``
+    is the whole remaining job.
 
-    Fails CLOSED when the deny-list is empty: before this fix the resolver
-    could fall through to a never-resolving ``Path.home() / ".hermes"`` which
-    produced a single root that ``relative_to()`` never matched, so the guard
-    silently stopped guarding anything. An empty deny-list now raises.
+    The previous design monkeypatched ``connect`` from here, which guarded
+    only callers that had ALREADY imported the module: a test doing a lazy
+    ``import hermes_cli.kanban_db_connect`` inside its body got the raw
+    function and wrote to the live board with a perfectly correct deny-list
+    in hand (reproduced; #69283 follow-up). Moving the check into
+    ``connect`` itself makes import order irrelevant.
 
-    Only patches when ``hermes_cli.kanban_db_connect`` is *already imported*
-    — a ``sys.modules`` probe, not an import — so the guard never drags the
-    kanban module into unrelated test processes.
-
-    Uses ``monkeypatch.setattr`` so pytest restores ``connect`` automatically
-    after each test (no stacked wrappers or state leakage across tests).
+    The roots stay a LIST rather than a single root because the board can be
+    pinned through THREE independent env vars — ``HERMES_KANBAN_HOME``,
+    ``HERMES_KANBAN_DB`` and ``HERMES_KANBAN_BOARD`` — and any one of them can
+    land a write outside every hermes root. See ``_capture_real_kanban_roots``.
     """
-    _kdb = sys.modules.get("hermes_cli.kanban_db")
-    _kdbc = sys.modules.get("hermes_cli.kanban_db_connect")
-    if _kdb is None or _kdbc is None:
-        return
+    from hermes_cli import kanban_test_guard as _ktg
 
-    # The sys.modules probe can observe the module MID-IMPORT: a fixture
-    # boundary firing while another test's lazy `import hermes_cli.kanban_db`
-    # is still executing sees a partially initialized module whose `connect`
-    # doesn't exist yet (AttributeError flake, caught in a full-suite run).
-    # A half-imported module has no callers yet either — nothing to guard
-    # this round; the next test's fixture will patch the completed module.
-    _orig_connect = getattr(_kdbc, "connect", None)
-    if _orig_connect is None or getattr(_kdb, "kanban_db_path", None) is None:
-        return
+    # The escape hatch is a production module global now, so the marker has to
+    # be honoured here — same shape as the sibling ``_state_db_write_guard``.
+    if request.node.get_closest_marker(_LIVE_SYSTEM_GUARD_BYPASS_MARK) is not None:
+        monkeypatch.setattr(_ktg, "_KANBAN_GUARD_BYPASS", True, raising=False)
 
-    def _guarded_connect(db_path=None, *args, **kwargs):
-        if db_path is not None:
-            resolved = Path(db_path).expanduser().resolve()
-        else:
-            resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
-            )
-        if not _REAL_KANBAN_ROOTS:
-            # Fail CLOSED. An empty deny-list used to be indistinguishable
-            # from "nothing to protect", and ``relative_to()`` against a
-            # never-resolved root then passed everything through — the guard
-            # silently stopped guarding. Refusing loudly is the safe default.
-            raise RuntimeError(
-                "kanban_write_guard: no REAL kanban root could be resolved from "
-                "the pre-test environment (HERMES_KANBAN_HOME / HERMES_KANBAN_DB / "
-                f"HERMES_HOME all unset or unresolvable), so the deny-list is empty "
-                f"and writes to {resolved} cannot be vetted. Refusing to write. "
-                "See #69283."
-            )
-        if _is_real_kanban_target(resolved):
-            raise RuntimeError(
-                f"kanban_write_guard: kanban DB path resolved to {resolved}, "
-                f"which is under a REAL kanban root {_REAL_KANBAN_ROOTS}. "
-                f"Hermetic isolation has been bypassed — refusing to write "
-                f"to the real board. See #69283."
-            )
-        return _orig_connect(db_path, *args, **kwargs)
-
-    monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
+    monkeypatch.setattr(
+        _ktg, "_KANBAN_GUARD_DENY_ROOTS", _REAL_KANBAN_ROOTS, raising=False
+    )
 
 
 # ── Live state.db write guard ───────────────────────────────────────────────

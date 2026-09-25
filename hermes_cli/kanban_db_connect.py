@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import kanban_test_guard as _ktg
 from pathlib import Path
 from typing import Any
 from typing import Optional
@@ -672,6 +673,15 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    # Test-isolation guard (#69283 follow-up): runs BEFORE any mkdir, lock or
+    # sqlite call so a rejected open leaves the real board completely
+    # untouched. The check lives at the call site, not in a conftest monkeypatch,
+    # because a fixture that patches `connect` can only patch it for callers
+    # that imported it already — a test doing a LAZY `import
+    # hermes_cli.kanban_db_connect` inside its body would get the raw function
+    # and write to the live board unguarded (reproduced). See
+    # hermes_cli/kanban_test_guard.py for the full rationale.
+    _ktg.ensure_kanban_test_isolation(path)
     from agent.delegation_context import is_delegated_child_process_context
     if is_delegated_child_process_context():
         # Reads must not enter schema/backfill write transactions. Never create a
