@@ -100,7 +100,7 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived", "trash"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
@@ -3942,6 +3942,50 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
+    _cleanup_workspace(conn, task_id)
+    return True
+
+
+def trash_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
+    """Move a task to the ``trash`` column: a terminal dead-end bin.
+
+    ``trash`` is deliberately NOT ``archive``. Archiving retires *finished*
+    work; trashing records a *deliberate dead end* — e.g. a proposal that is
+    impossible under an external constraint — so a later worker reads *why*
+    before re-deriving the same blocked approach. Trashed tasks keep their
+    whole history, are never dispatchable (the dispatcher only spawns
+    ``ready``), and leave the active board the way ``archived`` does.
+
+    Unlike ``archived``, a trashed task does NOT satisfy its dependents: the
+    work was never done, so children gated on it stay blocked.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'trash', "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status NOT IN ('trash', 'archived')",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        # Close a live run so attempt history isn't orphaned when a card is
+        # trashed while a worker still holds it.
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            summary="task moved to trash with run still active",
+        )
+        _append_event(
+            conn, task_id, "trashed",
+            {"reason": reason} if reason else None,
+            run_id=run_id,
+        )
+    # The workspace is dead weight once the card is a dead end.
     _cleanup_workspace(conn, task_id)
     return True
 

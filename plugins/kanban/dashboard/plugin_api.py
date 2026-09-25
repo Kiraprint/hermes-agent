@@ -316,7 +316,14 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
-            columns[t.status if t.status in columns else "todo"].append(d)
+            # ``trash`` (the CLI dead-end bin) has no dashboard column of its own: its cards
+            # ride the existing archived bucket, so they stay hidden by default exactly like
+            # archived cards. The card keeps its real ``status`` in the detail payload.
+            _column = "archived" if t.status == "trash" else t.status
+            if _column in columns:
+                columns[_column].append(d)
+            elif t.status != "trash":
+                columns["todo"].append(d)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
         # history, so order it newest-completed-first. Two stable sorts compose

@@ -1133,6 +1133,16 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 
+def _cmd_trash(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        return _err("at least one task_id is required")
+    reason = getattr(args, "reason", None)
+    with kbc.connect_closing() as conn:
+        return _bulk_apply(ids, lambda tid: kb.trash_task(conn, tid, reason=reason),
+                           lambda tid: f"Trashed {tid}", lambda tid: f"cannot trash {tid}")
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         stats = kb.board_stats(conn)
@@ -1329,7 +1339,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
-    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "archive": _cmd_archive, "trash": _cmd_trash, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,

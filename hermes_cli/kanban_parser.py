@@ -359,6 +359,11 @@ _SPECS = [
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
+    _cmd("trash", [
+        _TASK_IDS,
+        _reason("Why this is a dead end. Kept in the task's event log and shown "
+                "to later workers so they don't retry the same blocked approach."),
+    ], help="Move one or more tasks to the trash (dead-end bin)"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
