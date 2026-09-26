@@ -25,6 +25,7 @@ integration and explicitly configured Relay subscribers or exporters.
 | Health/lifecycle events | `/v1/traces` | `gateway.lifecycle` state transitions (`starting -> running -> draining -> stopped`, `startup_failed`, exit), `gateway.health_snapshot`, platform state changes |
 | Diagnostics | `/v1/logs` | Warning/error gateway events with a constant body and bounded subsystem, severity, error class, and error code attributes; rendered log messages are never exported |
 | Cron scheduler gauges | `/v1/metrics` | Ticker heartbeat and last-success age (omitted when unavailable), a monotonic catch-up-occurrence count from the scheduler's stale-window branch, enabled/running job counts, and overdue count derived from persisted `next_run_at` plus the scheduler's existing grace rule |
+| Fork-sync gauges | `/v1/metrics` | `hermes.fork_sync.up`, a `hermes.fork_sync.status` gauge carrying the bounded `status`/`reason` attributes (`healthy`/`degraded`/`unhealthy`/`unknown`), last-run exit code, last run/success age (omitted when unavailable), and the count of open conflict-escalation tasks. Read from the nightly runner's own log plus a read-only board query; never a path, task id, or free-form message |
 | Cron execution lifecycle | `/v1/traces` | Durable `claimed/running/completed/failed/unknown` states, bounded source and error class, opaque hashed job key, elapsed duration when timestamps exist, and delivery outcome when the scheduler knows it; terminal states make a fail-open flush attempt that can delay completion by up to one second |
 
 Signals carry `service.name`, version, supervision mode, and a stable one-way
@@ -133,7 +134,29 @@ hermes_cron_jobs_overdue > 0
 # Catch-up counter increased, proving at least one stale occurrence was
 # collapsed and run once after a delay.
 increase(hermes_cron_scheduler_catch_up_occurrences[15m]) > 0
+
+# Nightly fork/upstream sync is stale or failed. `up == 0` covers every
+# non-healthy status; the bounded status/reason attributes separate a stale
+# sync (degraded/stale_sync) from a failed run (unhealthy/push_failed or
+# run_failed) and from an unattended conflict (unhealthy/conflict_unattended).
+hermes_fork_sync_up == 0
+
+# A diverged fork nobody is looking at: conflict escalated but its board
+# escalation task is already closed.
+hermes_fork_sync_status{reason="conflict_unattended"} == 1
+
+# A successful sync has not been observed within the configured grace
+# (default 36h = nightly cadence plus one missed night).
+hermes_fork_sync_last_success_age_seconds > 129600
 ```
+
+Fork-sync divergence is reported as a status word, never as a gateway failure:
+the feed reads the runner's log and a read-only board query, and a broken read
+degrades the *reported status* instead of raising into the export loop. The same
+state is visible without a collector through the readiness endpoint
+(`checks.fork_sync` in `/api/status` and `/health/detailed`), and every
+transition into `degraded`/`unhealthy` (and the recovery back to `healthy`) is
+logged once as a structured gateway warning/info record.
 
 Cron execution lifecycle records arrive as `hermes.cron_execution` spans.
 Alert or derive events from bounded attributes such as:
@@ -176,6 +199,11 @@ collector and backend:
    remain healthy.
 5. **Killed gateway:** terminate one canary, verify missing-series detection,
    restart it, and confirm the same opaque instance identity returns.
+6. **Fork-sync divergence:** force a failed nightly fork/upstream sync (or a
+   stale one), observe `hermes.fork_sync.up == 0` with the expected bounded
+   `status`/`reason` attributes, the `checks.fork_sync` degradation in
+   `/api/status`, and the single structured warning; then restore a clean sync
+   and confirm the alert and the readiness check clear.
 
 Hermes Agent-owned Relay transport health remains in scope. A separate gateway
 or connector service remains authoritative for any shared connected-platform

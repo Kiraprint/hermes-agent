@@ -1852,6 +1852,31 @@ DEFAULT_CONFIG = {
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
     },
+    # Fork-sync liveness feed — the nightly fork/upstream sync runner
+    # (fork_sync_nightly.sh) writes a log contract and escalates unresolved
+    # rebase conflicts to a board task. The gateway reads both and reports
+    # healthy / degraded / unhealthy through the health endpoint and the
+    # fork-sync metrics. Read-only and fail-open: a broken read degrades the
+    # reported status and never blocks the dispatcher or the ready queue.
+    "fork_sync": {
+        # Master switch for the health feed (the runner itself is cron-owned
+        # and unaffected).
+        "enabled": True,
+        # Runner log to parse. Empty = <HERMES_HOME>/logs/fork-sync.log.
+        # $FORK_SYNC_LOG (the runner's own env var) always wins.
+        "log_path": "",
+        # Board whose open "Fork-sync конфликт" escalation tasks count as an
+        # owned conflict (degraded) instead of an unattended one (unhealthy).
+        # Empty = the current board.
+        "board": "",
+        # A successful sync older than this is stale -> degraded. Default 36h:
+        # one nightly cadence plus one missed night of grace.
+        "stale_after_seconds": 129600,
+        # Log-tail bytes parsed per read (bounded; never a whole-file read).
+        "tail_bytes": 65536,
+        # How often the gateway refreshes the feed (floor 30s).
+        "health_interval_seconds": 300,
+    },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.

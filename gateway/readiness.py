@@ -94,6 +94,27 @@ def _probe_session_store(runtime_status: dict[str, Any], state_db_probe: dict[st
     return _check("ok" if state_db_probe.get("status") == "ok" else "unavailable")
 
 
+def _probe_fork_sync() -> dict[str, Any]:
+    """Fork/upstream sync liveness (fork-sync feed), read from the cached snapshot.
+
+    A host that never ran the nightly runner reports ``unknown`` and stays ``ok`` —
+    the check exists to surface a *known* divergence, not to penalise hosts without
+    the runner.  The read itself is fail-open, so an unavailable feed degrades this
+    one check and never the readiness call.
+    """
+    try:
+        from agent.monitoring.fork_sync_health import fork_sync_health_snapshot
+        state = fork_sync_health_snapshot().state
+    except Exception as exc:
+        return _check("ok", f"unavailable ({type(exc).__name__})")
+    if state.status in {"degraded", "unhealthy"}:
+        return _check(
+            "degraded", state=state.status, reason=state.reason,
+            escalations_open=state.escalation_open,
+        )
+    return _check("ok", state=state.status, reason=state.reason)
+
+
 def collect_runtime_readiness(
     *, configured_model: str, runtime_status: dict[str, Any] | None, active_api_runs: int = 0,
     process_completion_queue_depth: int = 0, active_delegations: int = 0,
@@ -110,6 +131,8 @@ def collect_runtime_readiness(
         "model": _check("ok" if str(configured_model or "").strip() else "degraded"),
         "disk": _probe_disk(home),
         "gateway": _probe_gateway(runtime),
+        # Fork/upstream divergence: reported, never acted on (dispatch must not depend on it).
+        "fork_sync": _probe_fork_sync(),
         "background_queues": _check(
             "ok", active_api_runs=max(0, int(active_api_runs)),
             process_completions=max(0, int(process_completion_queue_depth)),

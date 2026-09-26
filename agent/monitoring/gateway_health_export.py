@@ -51,6 +51,12 @@ _OBSERVABLE_METRIC_NAMES = (
     "hermes.cron.scheduler.heartbeat_age_seconds", "hermes.cron.scheduler.last_success_age_seconds",
     "hermes.cron.scheduler.catch_up_occurrences", "hermes.cron.jobs.enabled", "hermes.cron.jobs.running",
     "hermes.cron.jobs.overdue",
+    # Fork-sync divergence feed (agent/monitoring/fork_sync_health.py): the nightly
+    # fork/upstream sync's liveness, so a diverged fork is visible before dispatch work
+    # silently builds on a stale base.
+    "hermes.fork_sync.up", "hermes.fork_sync.status", "hermes.fork_sync.last_exit_code",
+    "hermes.fork_sync.last_run_age_seconds", "hermes.fork_sync.last_success_age_seconds",
+    "hermes.fork_sync.escalations_open",
 )
 
 
@@ -145,6 +151,13 @@ def _read_cron_snapshot():
     return build_cron_health_snapshot()
 
 
+def _read_fork_sync_snapshot():
+    """Cached fork-sync projection — shares the gateway watcher's cache, so the
+    export thread never pays for a second log/board read."""
+    from agent.monitoring.fork_sync_health import fork_sync_health_snapshot
+    return fork_sync_health_snapshot()
+
+
 def _count(failure_msg: str, module: str, read: Callable[[Any], Any]) -> int:
     """Best-effort non-negative count read from a lazily imported module; 0 when it can't be imported/read."""
     try:
@@ -191,6 +204,16 @@ def _read_runtime_snapshot(config: Dict[str, Any]):
         # the exception *type* (the message could carry paths); exc_info stays on DEBUG.
         logger.warning("cron health snapshot unavailable; cron telemetry not exported (error_type=%s)", type(exc).__name__)
         logger.debug("cron health snapshot traceback", exc_info=True)
+    try:
+        gateway_snapshot.metrics.extend(_read_fork_sync_snapshot().metrics)
+    except Exception as exc:
+        # Same contract as cron: the feed is fail-open by construction, so reaching
+        # here means a vocabulary/wiring regression, not a broken runner.
+        logger.warning(
+            "fork-sync health snapshot unavailable; fork-sync telemetry not exported (error_type=%s)",
+            type(exc).__name__,
+        )
+        logger.debug("fork-sync health snapshot traceback", exc_info=True)
     return gateway_snapshot
 
 

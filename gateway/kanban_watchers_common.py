@@ -282,26 +282,34 @@ def _read_dispatcher_lease(lock_path) -> dict:
 def _lease_owner_alive(lease: dict) -> bool:
     """Best-effort liveness of the lease-recorded owner pid.
 
-    On POSIX ``os.kill(pid, 0)`` is a pure liveness probe. On Windows it is
-    NOT a no-op (sends CTRL_C to the console group — see gateway.status
-    ``_pid_exists``), so fall back to ``True``: a wedged owner on Windows is
-    only detectable via the heartbeat timeout, which is fine because the
-    flock can never be stolen from a live process anyway.
+    Delegates to :func:`gateway.status._pid_exists`, the single cross-platform
+    liveness probe: psutil first (zombies report dead, so a reaped-but-not-yet
+    parented owner does not wedge the lease), then ctypes ``OpenProcess`` on
+    Windows, then ``os.kill(pid, 0)`` on POSIX. Never call ``os.kill(pid, 0)``
+    directly here — on Windows it is NOT a no-op (it sends CTRL_C_EVENT to the
+    target's console process group, bpo-14484).
     """
     pid = lease.get("pid")
-    if not isinstance(pid, int) or pid <= 0:
+    # bool is a subclass of int — a lease record with pid=true is corrupt data,
+    # not "pid 1 owns the lease", so reject it before it reaches the probe.
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    if os.name == "nt":
-        return True
     try:
-        os.kill(pid, 0)
+        from gateway.status import _pid_exists
+    except ImportError:
+        # gateway.status unavailable (partial install): on Windows assume alive
+        # (the flock cannot be stolen from a live process anyway); elsewhere
+        # fall through to a POSIX-only probe.
+        if os.name == "nt":
+            return True
+        try:
+            os.kill(pid, 0)  # windows-footgun: ok — POSIX-only fallback branch
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
         return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
+    return bool(_pid_exists(pid))
 
 
 def _dispatcher_eligible_profiles(kanban_cfg) -> list:

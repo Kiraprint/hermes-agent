@@ -1487,6 +1487,9 @@ class GatewayStartupMixin:
     # Long-lived supervised watchers spawned at the end of start(), in order; supervised name = method
     # name minus the leading underscore.
     _PRE_RECONNECT_WATCHERS = (
+        # Fork-sync divergence feed first: it reports the liveness of the code base the
+        # dispatcher spawns workers from, and is fail-open so it can never gate dispatch.
+        "_fork_sync_health_watcher",
         "_session_housekeeping_watcher", "_model_catalog_refresh_watcher", "_session_stall_watcher",
         "_kanban_notifier_watcher", "_kanban_dispatcher_watcher",
     )
