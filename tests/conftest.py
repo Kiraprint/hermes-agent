@@ -93,8 +93,42 @@ def _hermes_home_points_at_production(value: str) -> bool:
         return True
     if resolved == real_root:
         return True
+    # The platform-default root lives INSIDE the pre-set value: the supervisor
+    # exported HERMES_HOME at a live install root and pointed HOME into that
+    # same root, so ``~/.hermes`` resolves *under* it instead of beside it —
+    #     HERMES_HOME=/opt/data                 HOME=/opt/data
+    #     HERMES_HOME=/opt/data/profiles/<name> HOME=<profile>/home
+    # That is every deployment shape (Docker root, per-profile gateway): the
+    # launcher hands its own install root to every shell it spawns. Reading it
+    # as a "genuinely custom" home skipped the session sandbox, and the
+    # collection-time import of ``hermes_cli.main`` then anchored the rotating
+    # file handlers at the LIVE ``<root>/logs`` — every ERROR the session
+    # emitted landed in the operator's errors.log. A throwaway override
+    # (tmpdir, scratch clone) never *contains* the real platform root, so this
+    # test cannot mistake one for the other.
+    if real_root.is_relative_to(resolved):
+        return True
     # Profile home directly under the production root: <root>/profiles/<name>
     return resolved.parent.name == "profiles" and resolved.parent.parent == real_root
+
+
+def _hermes_home_is_test_sandbox(value: str) -> bool:
+    """True when *value* is THIS session's sandbox home.
+
+    A conftest module body can be executed more than once (xdist workers re-exec
+    it); the second pass sees the already-redirected home in the env and must not
+    mistake it for the operator's real one. The value is captured pre-sandbox, so
+    the comparison is the only thing keeping a re-import off its own tail.
+    """
+    if not value:
+        return False
+    sandbox = os.environ.get("HERMES_TEST_SANDBOX_HOME", "")
+    if not sandbox:
+        return False
+    try:
+        return Path(value).expanduser().resolve() == Path(sandbox).expanduser().resolve()
+    except Exception:
+        return False
 
 
 # ``import hermes_bootstrap`` (transitively: any entry-point module) runs
@@ -597,16 +631,20 @@ def _capture_real_kanban_root() -> Path:
     """
     if _PRE_SANDBOX_KANBAN_OVERRIDE:
         return Path(_PRE_SANDBOX_KANBAN_OVERRIDE).expanduser().resolve()
-    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
+    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_is_test_sandbox(
         _PRE_SANDBOX_HERMES_HOME
     ):
-        # HERMES_HOME was genuinely set to a CUSTOM root before the sandbox
-        # (production-pointing values are sandboxed away above, in which case
-        # the env still holds the tempdir and the resolver would be wrong) —
-        # honor it via the normal resolver (it may be a profile dir whose
-        # root matters).
+        # HERMES_HOME was set before the sandbox — honor it via the normal
+        # resolver, which answers the right root for every deployment shape:
+        # the platform default for a plain ``~/.hermes``, ``<root>`` for
+        # ``<root>/profiles/<name>``, and the value itself for a Docker-style
+        # root (``HERMES_HOME=/opt/data``). The resolver is handed the
+        # PRE-SANDBOX value: this module body runs after the sandbox may have
+        # replaced HERMES_HOME, and reading the env here would make the deny-list
+        # point at the session's own tempdir (fail open). A re-imported conftest
+        # body is the only value that must not count: its home is test-owned.
         from hermes_constants import get_default_hermes_root
-        return get_default_hermes_root().resolve()
+        return get_default_hermes_root(home=_PRE_SANDBOX_HERMES_HOME).resolve()
     # No pre-existing HERMES_HOME: the real root is the platform default,
     # NOT the sandbox tempdir now sitting in the env.
     return (Path.home() / ".hermes").resolve()
@@ -697,7 +735,7 @@ def _state_db_write_guard(request, monkeypatch):
         yield
         return
     extra_roots = []
-    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
+    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_is_test_sandbox(
         _PRE_SANDBOX_HERMES_HOME
     ):
         extra_roots.append(
@@ -1084,6 +1122,10 @@ def pytest_unconfigure(config):  # noqa: D401 — pytest hook
 @pytest.hookimpl(trylast=True)  # after _pytest.tmpdir has built config._tmp_path_factory
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
+    # A handler bound before the sandbox (launcher-wired logging, or a home the
+    # production check misread) would send every record of this session into the
+    # operator's log file — drop it here, before collection imports anything.
+    _detach_live_log_handlers()
     _relocate_basetemp_outside_operator_home(config)
     config.addinivalue_line(
         "markers",
@@ -1342,15 +1384,16 @@ def _moa_caches_isolated():
 # into test assertions).
 #
 # The real root is captured at conftest import (pre-sandbox), honoring a
-# genuinely-custom pre-set HERMES_HOME exactly like the kanban deny-list
-# (_hermes_home_points_at_production governs which values count).
+# pre-set HERMES_HOME exactly like the kanban deny-list — every value except this
+# session's own sandbox home counts (a launcher-shaped install is as real as a
+# hand-set one; see ``_hermes_home_is_test_sandbox``).
 _REAL_HERMES_ROOT_CANDIDATES: list[Path] = []
 
 
 def _capture_real_hermes_root() -> list[Path]:
-    """The real root(s) to refuse: the default ~/.hermes plus a pre-sandbox
-    custom HERMES_HOME when one was set. Both are guarded — the default
-    because hardcoded restatements hit it; the custom one because
+    """The real root(s) to refuse: the default ~/.hermes plus the pre-sandbox
+    HERMES_HOME when one was set. Both are guarded — the default
+    because hardcoded restatements hit it; the pre-set one because
     deployment-shaped tests (Docker /opt/data) must not touch the operator's
     real custom root either."""
     import platform
@@ -1371,7 +1414,7 @@ def _capture_real_hermes_root() -> list[Path]:
                 roots.append(win_root)
         except Exception:
             pass
-    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
+    if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_is_test_sandbox(
         _PRE_SANDBOX_HERMES_HOME
     ):
         try:
@@ -1389,6 +1432,153 @@ def _capture_real_hermes_root() -> list[Path]:
 
 
 _REAL_HERMES_ROOT_CANDIDATES = _capture_real_hermes_root()
+
+
+# ── Live-log write guard ────────────────────────────────────────────────────
+# The sandbox above redirects HERMES_HOME before the first test module is
+# imported, so the import-time ``setup_logging()`` inside ``hermes_cli.main``
+# lands in the session tempdir. That only covers handlers bound *after* the
+# redirect. A handler that was already bound — the launcher wired logging in
+# this process before pytest started, or the home was not recognised as
+# production and collection anchored the handlers at ``<root>/logs`` first —
+# keeps writing to the operator's log for the whole session: the harness has no
+# way to unbind it, and the logging queue listener writes through an
+# already-open file object, so ``HomeIOGuard`` cannot see it either.
+#
+# Measured 2026-09-25: eight ``[api_server] Refusing to start`` ERROR records
+# in the live ``errors.log``, all of them emitted by
+# ``tests/gateway/test_api_server.py`` exercising the fails-closed guard.
+#
+# So: once the sandbox is in place, detach any FILE handler (on the root logger
+# or on the logging subsystem's queue listener) aimed into a live Hermes
+# ``logs/`` dir. pytest's own capture handlers are untouched; the session keeps
+# logging to whatever the sandboxed home provides.
+DETACHED_LIVE_LOG_HANDLERS: list[str] = []
+
+
+def _live_hermes_log_dirs() -> list[Path]:
+    """``<root>/logs`` for every Hermes root this session must not write into.
+
+    Unlike ``_REAL_HERMES_ROOT_CANDIDATES`` this keeps the PRE-SANDBOX
+    ``HERMES_HOME`` even when it is production-shaped: a launcher install
+    (``HERMES_HOME=/opt/data``, ``~/`` rewritten to ``/opt/data``) is redirected
+    away for test purposes, but a handler bound *before* that redirect — or by a
+    process that never ran the redirect — still points at its ``logs/``.
+    """
+    roots: list[Path] = []
+    try:
+        roots.append((Path.home() / ".hermes").resolve())
+    except Exception:
+        pass
+    localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+    if localappdata:
+        try:
+            roots.append((Path(localappdata) / "hermes").resolve())
+        except Exception:
+            pass
+    if _PRE_SANDBOX_HERMES_HOME:
+        try:
+            pre = Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve()
+        except Exception:
+            pre = None
+        sandbox = os.environ.get("HERMES_TEST_SANDBOX_HOME", "")
+        if pre is not None and not (sandbox and pre == Path(sandbox).expanduser().resolve()):
+            roots.append(pre)
+
+    dirs: list[Path] = []
+    for root in roots:
+        log_dir = root / "logs"
+        if log_dir not in dirs:
+            dirs.append(log_dir)
+    return dirs
+
+
+def _detach_live_log_handlers() -> list[str]:
+    """Detach file handlers still aimed at a live Hermes ``logs/`` dir.
+
+    Returns the log files that were detached (also appended to
+    ``DETACHED_LIVE_LOG_HANDLERS`` so a test can assert the guard fired).
+    """
+    import logging
+
+    live = _live_hermes_log_dirs()
+    if not live:
+        return []
+
+    def _live_target(handler) -> str:
+        base = getattr(handler, "baseFilename", None)
+        if not base:
+            return ""
+        try:
+            path = Path(base).resolve()
+        except Exception:
+            return ""
+        for log_dir in live:
+            if path.is_relative_to(log_dir):
+                return str(path)
+        return ""
+
+    owners = [logging.getLogger()]
+    logging_module = None
+    try:
+        import hermes_logging as logging_module
+
+        listener = getattr(logging_module, "_queue_listener", None)
+        if listener is not None:
+            owners.append(listener)
+    except Exception:
+        logging_module = None
+
+    def _forget(owner, handler) -> bool:
+        """Remove *handler* from *owner* (a Logger, a QueueListener, ...)."""
+        remover = getattr(owner, "removeHandler", None)
+        if callable(remover):
+            try:
+                remover(handler)
+                return True
+            except Exception:
+                pass
+        current = getattr(owner, "handlers", None)
+        try:
+            if isinstance(current, list):
+                current.remove(handler)
+                return True
+            if isinstance(current, tuple):
+                owner.handlers = tuple(h for h in current if h is not handler)
+                return True
+        except Exception:
+            pass
+        return False
+
+    detached: list[str] = []
+    for owner in owners:
+        for handler in list(getattr(owner, "handlers", ()) or ()):
+            target = _live_target(handler)
+            if not target:
+                continue
+            if not _forget(owner, handler):
+                continue
+            # The subsystem keeps its own registry and rebuilds the listener from
+            # it on every setup_logging()/restart — drop it there too, or the next
+            # import re-attaches the same live file.
+            registry = getattr(logging_module, "_queued_file_handlers", None)
+            if isinstance(registry, list) and handler in registry:
+                try:
+                    registry.remove(handler)
+                except ValueError:
+                    pass
+            detached.append(target)
+            DETACHED_LIVE_LOG_HANDLERS.append(target)
+            try:
+                handler.close()
+            except Exception:
+                pass
+    return detached
+
+
+def pytest_collectstart(collector):  # noqa: D401 — pytest hook
+    """Re-check before each module import: collection can wire new handlers."""
+    _detach_live_log_handlers()
 
 
 @pytest.fixture(autouse=True)
