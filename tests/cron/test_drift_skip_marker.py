@@ -22,14 +22,21 @@ from cron.scheduler import (
 
 
 class TestDriftSkipMarkerValue:
-    """The marker must be exactly WARNING so upstream error text
-    containing a model-drift WARNING is recognized by the guard."""
+    """The marker must be a SPECIFIC token, never a generic word.
+
+    The consumer (`_compose_run_delivery`) suppresses the entire delivery for any
+    failure whose text contains the marker, so a marker like ``WARNING`` silently
+    swallowed unrelated failures. The fork-side producer that emitted the marker is
+    gone after the upstream merge, so nothing emits it today - but the constant is
+    kept (and pinned here) for a re-introduced producer.
+    """
 
     def test_constant_value(self):
-        assert DRIFT_SKIP_MARKER == "WARNING"
+        assert DRIFT_SKIP_MARKER == "[drift_skip:silent]"
 
     def test_marker_is_not_generic(self):
-        assert DRIFT_SKIP_MARKER not in ("SILENT", "NO_REPLY", "SUPPRESS")
+        assert DRIFT_SKIP_MARKER not in ("SILENT", "NO_REPLY", "SUPPRESS", "WARNING")
+        assert not DRIFT_SKIP_MARKER.isalpha()
 
 
 class TestDriftSkipMarkerInComposeRunDelivery:
@@ -61,7 +68,7 @@ class TestDriftSkipMarkerInComposeRunDelivery:
 
     def test_marker_without_blocked_config_suppresses(self):
         job = self._job()
-        error = "WARNING: model drifted past threshold"
+        error = f"{DRIFT_SKIP_MARKER} model drifted past threshold"
         deliver_content, blocked_config, silent_alert, incident_acked, incident_id = (
             _compose_run_delivery(
                 job, success=False, error=error, final_response=None, output_file=None
@@ -73,7 +80,7 @@ class TestDriftSkipMarkerInComposeRunDelivery:
 
     def test_marker_without_blocked_config_not_blocked(self):
         job = self._job()
-        error = "WARNING: model drifted past threshold"
+        error = f"{DRIFT_SKIP_MARKER} model drifted past threshold"
         deliver_content, blocked_config, silent_alert, incident_acked, incident_id = (
             _compose_run_delivery(
                 job, success=False, error=error, final_response=None, output_file=None
@@ -82,6 +89,21 @@ class TestDriftSkipMarkerInComposeRunDelivery:
         assert incident_acked is True
         assert deliver_content == ""
         assert blocked_config is False
+
+    def test_generic_warning_text_is_not_suppressed(self):
+        """The old marker was the bare word WARNING, so any failure whose text
+        merely warned (fallback used, provider WARNING, ...) was swallowed - a
+        silent alert hole. A non-marker warning must deliver."""
+        job = self._job()
+        error = "WARNING: model drifted past threshold; fallback used"
+        deliver_content, blocked_config, silent_alert, incident_acked, incident_id = (
+            _compose_run_delivery(
+                job, success=False, error=error, final_response=None, output_file=None
+            )
+        )
+        assert blocked_config is False
+        assert incident_acked is False
+        assert "fallback used" in deliver_content
 
     def test_success_with_marker_still_delivers(self):
         job = self._job()
@@ -95,7 +117,7 @@ class TestDriftSkipMarkerInComposeRunDelivery:
 
     def test_marker_is_lowercase_not_suppressed(self):
         job = self._job()
-        error = "warning: model drifted"
+        error = "[DRIFT_SKIP:SILENT] model drifted"
         deliver_content, blocked_config, silent_alert, incident_acked, incident_id = (
             _compose_run_delivery(
                 job, success=False, error=error, final_response=None, output_file=None
@@ -124,7 +146,7 @@ class TestDriftSkipPublicPlumbing:
     def test_drift_skip_marker_public(self):
         from cron.scheduler import DRIFT_SKIP_MARKER as marker
 
-        assert marker == "WARNING"
+        assert marker == "[drift_skip:silent]"
 
     def test_compose_run_delivery_public(self):
         from cron.scheduler import _compose_run_delivery

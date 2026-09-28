@@ -565,7 +565,13 @@ def _cron_failure_marker_error(text: str) -> Optional[str]:
 
 
 # Marker used by downstream runtime guards to distinguish recoverable drift skips.
-DRIFT_SKIP_MARKER = "WARNING"
+# It MUST be a specific token, never a bare word such as "WARNING": the consumer
+# in _compose_run_delivery suppresses the whole delivery for any failure whose
+# text contains it, so a generic word silently swallows genuine failures. The
+# fork-side producer that emitted this marker did not survive the upstream merge
+# (nothing in the tree emits it today), so the constant is reserved for a
+# re-introduced producer and must not be widened again.
+DRIFT_SKIP_MARKER = "[drift_skip:silent]"
 
 
 def _is_cron_silence_response(text: str) -> bool:
