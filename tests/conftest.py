@@ -21,6 +21,7 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import atexit
+import functools
 import importlib
 import os
 import shutil
@@ -59,6 +60,11 @@ if str(PROJECT_ROOT) not in sys.path:
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+# Live board pin (injected into factory workers) and active board slug: the
+# deny-list below must know them too, otherwise a worker env that pins the
+# live DB with HERMES_KANBAN_DB alone escapes the guard entirely (#69385).
+_PRE_SANDBOX_KANBAN_DB = os.environ.get("HERMES_KANBAN_DB", "").strip()
+_PRE_SANDBOX_KANBAN_BOARD = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
 
 
 def _hermes_home_points_at_production(value: str) -> bool:
@@ -647,13 +653,31 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
 
 # ── Kanban write guard (#69283) ─────────────────────────────────────────────
 # When hermetic isolation is bypassed (stale checkout, wrong rootdir, direct
-# invocation), kanban writes silently pollute the real ~/.hermes. This autouse
-# fixture patches ``kanban_db_connect.connect`` to refuse writes whose resolved DB
-# path lands under the REAL kanban root (captured at import time, before any
-# fixture rewires the environment). A deny-list is used instead of an
-# allow-list because test-level fixtures legitimately move HERMES_HOME to
-# sibling directories — an allow-list captured at setup time would see the
-# stale autouse-set value and falsely reject hermetic tests (#69385 review).
+# invocation), kanban writes silently pollute the real board (the operator's
+# ~/.hermes or — in deployments where HERMES_KANBAN_DB pins it — the live
+# factory board). The guard patches ``kanban_db_connect.connect`` and refuses
+# writes whose resolved DB path lands in the LIVE kanban tree.
+#
+# Three rules, all decided at import time from the pre-sandbox env snapshot:
+#   1. DENY-LIST: a write is blocked when its path IS a live board DB —
+#      ``<root>/kanban/boards/<slug>/kanban.db``, ``<root>/boards/<slug>/…``,
+#      ``<root>/kanban.db`` or the pinned ``HERMES_KANBAN_DB``. Not a
+#      whole-directory prefix: worktree ``TMPDIR``, kanban scratch workspaces
+#      (the task worktrees a run executes from) and profile caches sit inside
+#      the very same tree, and prefix denial blocked those hermetic writes —
+#      the over-block reported together with the fail-open mode (#69385).
+#   2. FAIL-CLOSED: when the live root cannot be pinned (no HERMES_* env,
+#      HOME sandboxed, ~/.hermes missing) the guard refuses any write that is
+#      not provably hermetic (a per-test tempdir), instead of silently
+#      allowing everything it failed to classify.
+#   3. UNCONDITIONAL INSTALL: a session-scoped autouse fixture imports the
+#      kanban modules itself and patches them once per process. The previous
+#      function-scoped fixture only probed ``sys.modules`` and returned
+#      silently while the modules were absent or mid-import, so ``connect``
+#      stayed unguarded for the run and a full-suite run wrote real cards
+#      into the live board (both guard tests then reported DID NOT RAISE).
+# There is no bypass marker for live-root writes: operator decision is
+# fail-closed; hermetic tests are the only exempt writes.
 
 
 def _capture_real_kanban_root() -> Path:
@@ -686,59 +710,224 @@ def _capture_real_kanban_root() -> Path:
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()
 
 
-@pytest.fixture(autouse=True)
-def _kanban_write_guard(_hermetic_environment, monkeypatch):
-    """Fail-closed guard: refuse kanban writes that target the REAL root.
+def _resolve_lenient(path) -> Path:
+    """``Path.resolve()`` surviving not-yet-created (and odd) paths."""
+    try:
+        return Path(path).expanduser().resolve()
+    except OSError:  # pragma: no cover - exotic unresolvable paths
+        return Path(path).expanduser().resolve(strict=False)
 
-    Uses a **deny-list**: only blocks writes where the resolved DB path
-    (explicit ``db_path`` or ``kanban_db_path()``) lands under the real
-    ``~/.hermes`` captured at import time. Hermetic tests that legitimately
-    move HERMES_HOME to sibling tempdirs are unaffected.
 
-    Only patches when ``hermes_cli.kanban_db_connect`` is *already imported*
-    — a ``sys.modules`` probe, not an import — so the guard never drags the
-    kanban module into unrelated test processes.
+def _path_under(path: Path, root: Path) -> bool:
+    try:
+        _resolve_lenient(path).relative_to(_resolve_lenient(root))
+    except ValueError:
+        return False
+    return True
 
-    Uses ``monkeypatch.setattr`` so pytest restores ``connect`` automatically
-    after each test (no stacked wrappers or state leakage across tests).
+
+def _capture_real_kanban_roots() -> tuple[Path, ...]:
+    """Every root that can host a REAL (non-test) kanban board.
+
+    One root is not enough: a factory worker pins the live board with
+    ``HERMES_KANBAN_DB`` alone, a developer shell may only have ``HERMES_HOME``,
+    and the legacy ``~/.hermes`` root has to stay covered — protecting a single
+    env var leaves the other modes fail-open (#69385 review).
     """
-    _kdb = sys.modules.get("hermes_cli.kanban_db")
-    _kdbc = sys.modules.get("hermes_cli.kanban_db_connect")
-    if _kdb is None or _kdbc is None:
-        return
+    roots: list[Path] = []
 
-    # The sys.modules probe can observe the module MID-IMPORT: a fixture
-    # boundary firing while another test's lazy `import hermes_cli.kanban_db`
-    # is still executing sees a partially initialized module whose `connect`
-    # doesn't exist yet (AttributeError flake, caught in a full-suite run).
-    # A half-imported module has no callers yet either — nothing to guard
-    # this round; the next test's fixture will patch the completed module.
-    _orig_connect = getattr(_kdbc, "connect", None)
-    if _orig_connect is None or getattr(_kdb, "kanban_db_path", None) is None:
-        return
+    def _add(candidate) -> None:
+        resolved = _resolve_lenient(candidate)
+        if resolved not in roots:
+            roots.append(resolved)
+
+    _add(_REAL_KANBAN_ROOT)
+    _add(Path.home() / ".hermes")
+    if _PRE_SANDBOX_KANBAN_DB:
+        db = _resolve_lenient(_PRE_SANDBOX_KANBAN_DB)
+        # ``<root>/kanban/boards/<slug>/kanban.db`` -> ``<root>``, so a bare
+        # DB pin still protects every board of that live tree.
+        if (
+            len(db.parents) > 3
+            and db.parents[1].name == "boards"
+            and db.parents[2].name == "kanban"
+        ):
+            _add(db.parents[3])
+    return tuple(roots)
+
+
+def _capture_kanban_deny_entries() -> tuple[tuple[str, Path], ...]:
+    """``("exact" | "boarddb", path)`` entries covering the live board DBs.
+
+    ``boarddb`` matches ``<entry>/<slug>/kanban.db`` — every named board DB —
+    while leaving the rest of that tree alone: kanban scratch workspaces (the
+    task worktrees a run executes from) sit under the very same boards dir,
+    and a whole-directory prefix blocked those legitimate hermetic writes —
+    the over-block reported together with the fail-open mode.
+    """
+    entries: list[tuple[str, Path]] = []
+    roots = _capture_real_kanban_roots()
+
+    def _add(kind: str, candidate) -> None:
+        entry = (kind, _resolve_lenient(candidate))
+        if entry not in entries:
+            entries.append(entry)
+
+    for root in roots:
+        _add("boarddb", root / "kanban" / "boards")  # <root>/kanban/boards/<slug>/
+        _add("boarddb", root / "boards")             # HERMES_KANBAN_HOME layout
+        _add("exact", root / "kanban.db")            # the default board
+    if _PRE_SANDBOX_KANBAN_DB:
+        # The worker's live pin — may live outside every root above.
+        _add("exact", _PRE_SANDBOX_KANBAN_DB)
+    return tuple(entries)
+
+
+def _is_live_board_db(resolved: Path, boards_dir: Path) -> bool:
+    """Is ``resolved`` exactly ``<boards_dir>/<slug>/kanban.db``?"""
+    if resolved.name != "kanban.db":
+        return False
+    try:
+        relative = resolved.relative_to(boards_dir)
+    except ValueError:
+        return False
+    return len(relative.parts) == 2
+
+
+def _capture_kanban_root_determined() -> bool:
+    """False when the live root cannot be pinned from the pre-test env.
+
+    ``HOME`` redirected into a test sandbox or a profile dir with no
+    ``HERMES_*`` fallback means ``Path.home() / ".hermes"`` points where the
+    guard cannot verify anything — guessing there is exactly the silent
+    fail-open the operator ruled out: fail-closed, no bypass marker.
+    """
+    if (
+        _PRE_SANDBOX_KANBAN_OVERRIDE
+        or _PRE_SANDBOX_KANBAN_DB
+        or _PRE_SANDBOX_KANBAN_BOARD
+        or _PRE_SANDBOX_HERMES_HOME
+    ):
+        return True
+    home = Path.home()
+    if _path_under(home, Path(tempfile.gettempdir())):
+        return False
+    if home.name == "home" and home.parent.parent.name == "profiles":
+        return False
+    return (home / ".hermes").exists()
+
+
+_REAL_KANBAN_DENY_ENTRIES = _capture_kanban_deny_entries()
+_KANBAN_ROOT_DETERMINED = _capture_kanban_root_determined()
+
+
+def _is_hermetic_kanban_path(path: Path) -> bool:
+    """Is ``path`` inside a directory this test run itself owns?"""
+    roots = [Path(tempfile.gettempdir())]
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home:
+        roots.append(Path(hermes_home))
+    return any(_path_under(path, root) for root in roots)
+
+
+def _kanban_write_guard_check(resolved: Path) -> None:
+    """Raise ``RuntimeError`` when a test must not open ``resolved``.
+
+    The deny-list always wins (paths of the LIVE board), then the fail-closed
+    rule applies for as long as the live root is unknown.
+    """
+    resolved = _resolve_lenient(resolved)
+    for kind, root in _REAL_KANBAN_DENY_ENTRIES:
+        if kind == "exact":
+            blocked = resolved == root
+        else:
+            blocked = _is_live_board_db(resolved, root)
+        if blocked:
+            raise RuntimeError(
+                f"kanban_write_guard: kanban DB path resolved to {resolved}, "
+                f"which is part of the LIVE kanban tree ({root}). Hermetic "
+                f"isolation has been bypassed — refusing to write to the real "
+                f"board. See #69283."
+            )
+    if not _KANBAN_ROOT_DETERMINED and not _is_hermetic_kanban_path(resolved):
+        raise RuntimeError(
+            f"kanban_write_guard: live kanban root is unknown (fail-closed) "
+            f"and {resolved} is not a hermetic test path — refusing to write. "
+            f"See #69283."
+        )
+
+
+_KANBAN_GUARD_MARK = "_hermes_test_write_guard"
+_KANBAN_GUARD_ORIG = "_hermes_test_write_guard_orig"
+
+
+def _install_kanban_write_guard() -> bool:
+    """Patch ``kanban_db_connect.connect`` with the deny-list guard (idempotent).
+
+    Returns ``True`` when this call performed the patch. The install happens at
+    conftest import time — BEFORE pytest imports a single test module — so a
+    module-level ``from hermes_cli.kanban_db_connect import connect`` in a test
+    file binds the guarded function instead of bypassing it by value, and so no
+    test body can ever run first. The previous function-scoped fixture probed
+    ``sys.modules`` and returned silently whenever ``hermes_cli.kanban_db
+    [_connect]`` was absent or mid-import, which left ``connect`` unguarded for
+    the whole run: a full-suite run wrote real cards into the live board and
+    both guard tests then reported DID NOT RAISE (#69283).
+    """
+    from hermes_cli import kanban_db as _kdb
+    from hermes_cli import kanban_db_connect as _kdbc
+
+    if getattr(_kdbc, _KANBAN_GUARD_MARK, False):
+        return False
+
+    _orig_connect = _kdbc.connect
 
     def _guarded_connect(db_path=None, *args, **kwargs):
         if db_path is not None:
-            resolved = Path(db_path).expanduser().resolve()
+            resolved = Path(db_path)
         else:
-            resolved = (
-                _kdb.kanban_db_path(board=kwargs.get("board"))
-                .expanduser()
-                .resolve()
-            )
-        try:
-            resolved.relative_to(_REAL_KANBAN_ROOT)
-        except ValueError:
-            # Resolved path is NOT under the real root — safe to write.
-            return _orig_connect(db_path, *args, **kwargs)
-        raise RuntimeError(
-            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
-            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
-            f"Hermetic isolation has been bypassed — refusing to write "
-            f"to the real ~/.hermes. See #69283."
-        )
+            resolved = _kdb.kanban_db_path(board=kwargs.get("board"))
+        _kanban_write_guard_check(resolved)
+        return _orig_connect(db_path, *args, **kwargs)
 
-    monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
+    _guarded_connect = functools.wraps(_orig_connect)(_guarded_connect)
+    # Mark BOTH the wrapper (so a value-imported ``connect`` can be identified
+    # anywhere) and the module attribute (so the install stays idempotent).
+    setattr(_guarded_connect, _KANBAN_GUARD_MARK, True)
+    _kdbc.connect = _guarded_connect
+    setattr(_kdbc, _KANBAN_GUARD_MARK, True)
+    setattr(_kdbc, _KANBAN_GUARD_ORIG, _orig_connect)
+    return True
+
+
+# Installed at import: conftest is imported before any test module, so every
+# ``import connect`` written at module scope in a test file captures the
+# guarded function, and every session inherits the patch.
+_KANBAN_GUARD_INSTALLED_AT_IMPORT = _install_kanban_write_guard()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _kanban_write_guard_session():
+    """Every session starts with the guard installed (#69283).
+
+    Import-time installation is the real guarantee; this fixture re-asserts it
+    per session (an idempotent no-op when already in place) so the per-session
+    contract is visible and testable on its own.
+    """
+    _install_kanban_write_guard()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _kanban_write_guard(_hermetic_environment):
+    """Re-assert the guard before every test.
+
+    A test that swaps ``connect`` back to the unpatched function must not
+    disarm the guard for the rest of the session; this costs one attribute
+    probe and reinstalls only if the patch is actually missing.
+    """
+    _install_kanban_write_guard()
+    yield
 
 
 # ── Live state.db write guard ───────────────────────────────────────────────
