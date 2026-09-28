@@ -15,9 +15,13 @@
 #     full PyYAML API (yaml.SafeDumper in hermes-agent utils.py, ...). Install
 #     the pure-Python package for whatever interpreter the image exposes, so the
 #     answer never depends on which python3 PATH resolves to.
+#  3. hermes_cli/kanban_db.py: trashing a *running* card now terminates its
+#     worker (PR #30, merge 46593ada33) instead of only nulling worker_pid, which
+#     left an orphan process burning tokens against a card nothing tracks.
 ARG BASE=hermes-agent:merged-bff18e6ff0-gtk
 FROM ${BASE}
 COPY agent/agent_runtime_helpers.py /opt/hermes/agent/agent_runtime_helpers.py
+COPY hermes_cli/kanban_db.py /opt/hermes/hermes_cli/kanban_db.py
 COPY vendor/pyyaml/yaml /tmp/pyyaml/yaml
 RUN set -eu; \
     installed=0; \
