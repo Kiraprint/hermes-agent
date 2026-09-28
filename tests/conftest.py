@@ -804,7 +804,37 @@ def _kanban_write_guard_check(resolved: Path) -> None:
 
     The deny-list always wins (paths of the LIVE board), then the fail-closed
     rule applies for as long as the live root is unknown.
+
+    The lexical check runs FIRST: deciding that a caller-supplied path belongs
+    to the live tree must not touch the filesystem, because the live tree is
+    exactly what ``home_io_guard`` forbids probing — resolving first made this
+    guard trip the safety net instead of refusing cleanly. A path that only
+    *reaches* the live tree through a symlink is still caught by the resolved
+    pass below.
     """
+    lexical = Path(resolved).expanduser()
+    parts = lexical.parts
+    for kind, root in _REAL_KANBAN_DENY_ENTRIES:
+        root_parts = root.parts
+        relative = (
+            parts[len(root_parts):]
+            if len(parts) > len(root_parts) and parts[:len(root_parts)] == root_parts
+            else None
+        )
+        if kind == "exact":
+            hit = lexical == root
+        else:
+            # Mirror _is_live_board_db's shape: <root>/<slug>/kanban.db only —
+            # a prefix rule would over-block the task worktrees that live under
+            # the same boards dir.
+            hit = relative is not None and len(relative) == 2 and relative[1] == "kanban.db"
+        if hit:
+            raise RuntimeError(
+                f"kanban_write_guard: kanban DB path resolved to {lexical}, "
+                f"which is part of the LIVE kanban tree ({root}). Hermetic "
+                f"isolation has been bypassed — refusing to write to the real "
+                f"board. See #69283."
+            )
     resolved = _resolve_lenient(resolved)
     for kind, root in _REAL_KANBAN_DENY_ENTRIES:
         if kind == "exact":
