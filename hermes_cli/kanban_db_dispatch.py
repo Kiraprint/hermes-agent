@@ -79,6 +79,30 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Consecutive ``lost_status`` requeues allowed before a run whose exit status
+# was never observed counts as a real crash. The dispatcher legitimately loses
+# a worker's exit status whenever the process that spawned it was replaced
+# (restart, recreate, reap-registry TTL), which says nothing about the task;
+# but a task whose workers keep vanishing must still trip the breaker once the
+# requeue budget is spent, or a genuinely broken card would requeue forever.
+DEFAULT_LOST_STATUS_REQUEUE_LIMIT = 3
+
+
+def _lost_status_requeue_limit() -> int:
+    """``HERMES_KANBAN_LOST_STATUS_REQUEUE_LIMIT`` else the default.
+
+    ``0`` (or any negative value) means "no cap": every lost exit stays a neutral
+    requeue, which is what a restart-heavy window wants.
+    """
+    raw = os.environ.get("HERMES_KANBAN_LOST_STATUS_REQUEUE_LIMIT")
+    if raw is None or raw == "":
+        return DEFAULT_LOST_STATUS_REQUEUE_LIMIT
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_LOST_STATUS_REQUEUE_LIMIT
+    return max(0, limit)
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -192,6 +216,10 @@ class DispatchResult:
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    lost_status: list[str] = field(default_factory=list)
+    """Task ids requeued WITHOUT counting a failure because this dispatcher never
+    observed their worker's exit status (a previous process reaped it, or the
+    reap registry aged out). An observation gap, not a verdict on the task."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -224,6 +252,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.lost_status:
+            counts["lost_status"] = counts.get("lost_status", 0) + len(res.lost_status)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -1008,6 +1038,29 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+def _lost_status_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing runs whose exit status the dispatcher never saw.
+
+    Newest-first walk, the same shape as :func:`_protocol_violation_streak`.
+    Used to cap neutral ``lost_status`` requeues: the first
+    ``DEFAULT_LOST_STATUS_REQUEUE_LIMIT`` of them cost the task nothing, but a
+    task that keeps losing its workers must eventually spend a real failure so
+    the breaker can stop an endless requeue loop.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        if (row["outcome"] or "") == "lost_status" or _kb._json_dict(row["metadata"]).get("lost_status"):
+            streak += 1
+            continue
+        break
+    return streak
+
 _PROTOCOL_VIOLATION_ERROR = (
     # Worker subprocess returned 0 but its task is still ``running`` in the DB — it exited without calling
     # ``kanban_complete`` / ``kanban_block`` / ``kanban_request_review``. Overwhelmingly the work itself succeeded and only the
@@ -1075,6 +1128,12 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    lost_status: bool = False
+    """The dispatcher never observed this worker's exit status because another
+    process spawned it (the claim lock names a foreign pid), so the status cannot
+    reach this process's reap registry by construction. Booked as a neutral
+    requeue: an observation gap of THIS process, not evidence the task is broken,
+    so it must not spend the task's failure budget."""
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
@@ -1082,7 +1141,11 @@ class _DeadWorker:
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall; a requeue whose exit
+        # status was never observed is recorded as ``lost_status`` for the same
+        # reason (it is an observation gap, not a verdict on the task).
+        if self.lost_status:
+            return "lost_status"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -1102,6 +1165,20 @@ def _classify_dead_worker(
             dead.error_text += f" Worker's last output: {worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
     return dead
+
+
+def _claim_owner_is_this_process(claimer: Optional[str]) -> bool:
+    """Whether ``claimer`` (a ``<host>:<pid>`` claim lock) was issued HERE.
+
+    The reap registry only ever holds children of THIS process, so a claim lock
+    carrying a different pid means the dispatcher that spawned the worker is gone
+    (restart, container recreate, singleton-lock handover) and the worker's exit
+    status can never reach us. Unparseable/legacy locks are assumed ours so the
+    upstream booking for them is untouched.
+    """
+    if not claimer or ":" not in claimer:
+        return True
+    return claimer.rsplit(":", 1)[1] == str(os.getpid())
 
 
 def _classify_dead_worker_exit(
@@ -1124,6 +1201,22 @@ def _classify_dead_worker_exit(
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
+    if kind == "unknown" and not _claim_owner_is_this_process(claimer):
+        # The claim lock names another pid: this dispatcher never spawned the
+        # worker, so its exit status is unobservable BY CONSTRUCTION and its
+        # absence is not a verdict on the task. Book a neutral requeue instead of
+        # the phantom crash (the ~2372 ``pid N not alive`` auto-block class: a
+        # recreate reaped every worker and each one was charged to its card).
+        # Same-process deaths keep the upstream booking (a worker that died
+        # without a status while WE watched it really is a crash).
+        return _DeadWorker(
+            kind, None,
+            f"pid {pid} exit status was not observed by this dispatcher "
+            f"(claim {claimer} came from another process) — requeued without counting a failure",
+            "lost_status",
+            {"pid": pid, "claimer": claimer, "exit_kind": "unknown", "lost_status": True},
+            lost_status=True,
+        )
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
         # paperwork was skipped; the corrective sentence reaches the retry
@@ -1177,6 +1270,7 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    lost_status: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1209,6 +1303,20 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            if dead.lost_status and _lost_status_requeue_limit():
+                # Bounded: a neutral requeue must not become an endless loop for a
+                # card whose workers keep vanishing, so past the limit the same
+                # death is re-booked as a real crash and spends a strike.
+                lost_before = _lost_status_streak(conn, row["id"])
+                if lost_before >= _lost_status_requeue_limit():
+                    dead = _DeadWorker(
+                        dead.kind, dead.code,
+                        f"pid {pid} exit status was not observed by this dispatcher "
+                        f"{lost_before} runs in a row — counting a failure so the task cannot requeue for ever",
+                        "crashed",
+                        {"pid": pid, "claimer": row["claim_lock"], "exit_kind": "unknown",
+                         "lost_status_requeues": lost_before},
+                    )
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             # Crash-requeue review-handoff recovery (mechanism A, t_91c7c52f):
             # a crashed run whose task carries a fresh PR comment goes to the
@@ -1251,7 +1359,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.lost_status:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1261,7 +1369,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
                 )
-            if dead.rate_limited:
+            if dead.lost_status:
+                sweep.lost_status.append(row["id"])
+            elif dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
@@ -1367,6 +1477,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_lost_status = sweep.lost_status  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -2219,6 +2330,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.lost_status.extend(getattr(detect_crashed_workers, "_last_lost_status", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

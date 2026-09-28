@@ -384,6 +384,100 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_foreign_claim_lost_exit_status_requeues_neutrally_and_is_capped(kanban_home, monkeypatch):
+    """A worker claimed by ANOTHER process is requeued WITHOUT spending the
+    task's failure budget: its exit status can never reach this process's reap
+    registry, so the missing status is an observation gap, not a verdict.
+
+    Regression for the ``pid N not alive`` auto-block class (~2372 runs): a
+    container recreate (or a dispatcher singleton handover) kills the workers of
+    the previous process, and every reclaim booked a phantom crash against an
+    innocent card. The neutral requeue is capped so a card that keeps losing its
+    workers still trips the breaker, and a death observed by THIS process is
+    still booked as a real crash.
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_LOST_STATUS_REQUEUE_LIMIT", "2")
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        # A pid that is not ours: the claim came from a dispatcher that is gone.
+        foreign = f"{host}:999999"
+        tid = kb.create_task(conn, title="lost", assignee="a")
+
+        for i in range(2):
+            pid = 80000 + i
+            kb.claim_task(conn, tid, claimer=f"{foreign.rpartition(':')[0]}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, claim_lock=?, consecutive_failures=? WHERE id=?",
+                (pid, foreign, 0, tid),
+            )
+            conn.commit()
+            # Deliberately no _record_worker_exit: the status is unobservable.
+
+            crashed = kbd.detect_crashed_workers(conn)
+            assert tid not in crashed, f"hit {i}: a lost exit status is not a crash"
+            assert tid in getattr(_kbd.detect_crashed_workers, "_last_lost_status", [])
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", f"hit {i}: got {task.status}"
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: a lost exit status must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+            assert task.last_failure_error and "not observed" in task.last_failure_error
+
+        # Budget spent: the next unobservable death is booked as a real crash, so
+        # an endlessly vanishing worker cannot requeue for ever.
+        kb.claim_task(conn, tid, claimer=f"{foreign.rpartition(':')[0]}:w9")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, claim_lock=?, consecutive_failures=? WHERE id=?",
+            (80099, foreign, 0, tid),
+        )
+        conn.commit()
+        crashed = kbd.detect_crashed_workers(conn)
+        assert tid in crashed
+        assert tid not in getattr(_kbd.detect_crashed_workers, "_last_lost_status", [])
+
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id", (tid,),
+            ).fetchall()
+        ]
+        assert outcomes == ["lost_status", "lost_status", "crashed"], outcomes
+
+
+def test_same_process_death_without_status_is_still_a_crash(kanban_home, monkeypatch):
+    """The neutral requeue keys off the claim lock's pid, not the missing status:
+    a worker claimed by THIS process that dies without a recorded status is
+    still a crash, so the tolerance cannot hide a genuinely broken card."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="own", assignee="a")
+        # Same pid as this process: the dispatcher owned the child.
+        kb.claim_task(conn, tid, claimer=_kb._claimer_id())
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (80100, tid))
+        conn.commit()
+
+        crashed = kbd.detect_crashed_workers(conn)
+        assert tid in crashed
+        assert tid not in getattr(_kbd.detect_crashed_workers, "_last_lost_status", [])
+        run = conn.execute(
+            "SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC", (tid,),
+        ).fetchone()
+        assert run["outcome"] == "crashed"
+        assert "not alive" in (run["error"] or "")
+
+
 @pytest.mark.parametrize("lane", ["ready", "review"])
 def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_home, monkeypatch, lane):
     """A worker that exits ``KANBAN_TERMINAL_PROVIDER_EXIT_CODE`` (credential revoked, model
@@ -1562,7 +1656,7 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kbd._resolve_hermes_argv() == [sys.executable, "-P", "-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
