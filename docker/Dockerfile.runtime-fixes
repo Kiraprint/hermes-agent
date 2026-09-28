@@ -21,11 +21,19 @@
 #  4. hermes_cli/kanban_db_dispatch.py: worker argv carries -P so the harness
 #     never imports hermes from the task workspace (workers run with
 #     TERMINAL_CWD = a checkout of this repo, and the cwd wins for `-m`).
+#  5. hermes_cli/kanban_db_dispatch.py: a worker whose exit status is
+#     unobservable (claimed by a previous dispatcher process) is requeued as
+#     `lost_status` instead of being booked as a crash, with a bounded cap.
+#  6. cron/scheduler.py: DRIFT_SKIP_MARKER narrowed from the bare word
+#     "WARNING" to "[drift_skip:silent]" — the consumer suppresses a failed
+#     run's delivery when its error text contains the marker, so the generic
+#     word silently swallowed unrelated failures.
 ARG BASE=hermes-agent:merged-bff18e6ff0-gtk
 FROM ${BASE}
 COPY agent/agent_runtime_helpers.py /opt/hermes/agent/agent_runtime_helpers.py
 COPY hermes_cli/kanban_db.py /opt/hermes/hermes_cli/kanban_db.py
 COPY hermes_cli/kanban_db_dispatch.py /opt/hermes/hermes_cli/kanban_db_dispatch.py
+COPY cron/scheduler.py /opt/hermes/cron/scheduler.py
 COPY vendor/pyyaml/yaml /tmp/pyyaml/yaml
 RUN set -eu; \
     installed=0; \
