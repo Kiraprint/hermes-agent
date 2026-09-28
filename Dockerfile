@@ -282,9 +282,22 @@ RUN python3 -m pm.build_env --source /opt/hermes --python /usr/local/bin/python3
 # while runtime scripts and repo code legitimately `import yaml` (config-guard,
 # hh-agent core/*, hermes-agent utils.py exercised by factory kanban tasks).
 # Bake the pure-Python PyYAML 6.0.3 package (MIT, vendored under vendor/pyyaml)
-# so every interpreter in the image resolves the full public API (SafeDumper,
-# safe_dump, ...) instead of only hermes_yaml's safe subset.
-COPY vendor/pyyaml/yaml /opt/hermes/.venv/lib/python3.14/site-packages/yaml
+# into every interpreter's site-packages so the import never depends on which
+# python3 PATH resolves to.
+COPY vendor/pyyaml/yaml /tmp/pyyaml/yaml
+RUN set -eu; \
+    installed=0; \
+    for d in /opt/hermes/.venv/lib/python3.*/site-packages \
+             /opt/hermes/tools/python-*/lib/python3.*/site-packages \
+             /usr/lib/python3/dist-packages; do \
+        [ -d "$d" ] || continue; \
+        rm -rf "$d/yaml"; \
+        cp -r /tmp/pyyaml/yaml "$d/yaml"; \
+        installed=$((installed + 1)); \
+        echo "pyyaml -> $d"; \
+    done; \
+    [ "$installed" -gt 0 ] || { echo "no site-packages found for pyyaml" >&2; exit 1; }; \
+    rm -rf /tmp/pyyaml
 
 # Icons render on the runtime environment: Pillow and resvg-py are core
 # dependencies. A stage of its own so the frontend stage keeps building its
