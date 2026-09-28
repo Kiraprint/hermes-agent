@@ -1884,6 +1884,59 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
     )
 
 
+def _fallback_entry_base_url(agent, fb: dict, fb_provider: str) -> str:
+    """The endpoint a fallback entry would dial, for sidecar identity.
+
+    The entry dict rarely carries ``base_url`` (the shipped chain is provider+model
+    only), so resolve it the same way the walk does — through the provider's configured
+    endpoint — and fall back to the agent's own base_url when the entry routes through
+    the provider the agent is already on. An empty answer is safe: the sidecar then
+    matches on the provider label instead.
+    """
+    hint = str(fb.get("base_url") or "").strip()
+    if hint:
+        return hint
+    try:
+        from hermes_cli.config import load_config
+        providers = (load_config() or {}).get("providers") or {}
+        entry = providers.get(fb_provider) or providers.get(fb_provider.split(":", 1)[-1])
+        if isinstance(entry, dict) and entry.get("base_url"):
+            return str(entry["base_url"]).strip()
+    except Exception as exc:
+        logger.debug("Fallback base_url lookup skipped for %s: %s", fb_provider, exc)
+    if fb_provider and fb_provider == (getattr(agent, "requested_provider", "") or "").strip().lower():
+        return str(getattr(agent, "_primary_runtime", {}).get("base_url") or "")
+    return ""
+
+
+def _arm_entry_rate_limit_cooldown(agent, reason: "FailoverReason | None", reset_at=None) -> None:
+    """Record the failing ``(provider, model)`` in the durable per-entry cooldown sidecar.
+
+    Only for rate-limit-shaped failures, and only for a model slug we can name: the
+    primary's own provider/model when the walk leaves it, or the entry that just
+    failed when the walk is already running on a fallback. A provider-wide outage
+    still benches every distinct model, which is the intended granularity — one
+    model cooling down must not bench its healthy siblings.
+    """
+    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
+    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+        return
+    primary = agent._primary_runtime or {}
+    on_fallback = bool(getattr(agent, "_fallback_activated", False))
+    provider = (getattr(agent, "provider", "") if on_fallback else primary.get("provider")) or ""
+    model = (getattr(agent, "model", "") if on_fallback else primary.get("model")) or ""
+    base_url = (getattr(agent, "base_url", "") if on_fallback else primary.get("base_url")) or ""
+    if not model:
+        return
+    try:
+        from agent.fallback_rate_limit_sidecar import arm_cooldown, cooldown_seconds_from_error
+        seconds = cooldown_seconds_from_error(str(getattr(agent, "_last_api_error_message", "") or ""),
+                                              {"reset_at": reset_at} if reset_at is not None else None)
+        arm_cooldown(provider, model, seconds, base_url=base_url)
+    except Exception as exc:
+        logger.debug("Rate-limit sidecar arming skipped: %s", exc)
+
+
 def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
     """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
     short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
@@ -1926,6 +1979,14 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     if _candidate_pool_exhausted(agent, fb_provider, fb_model):
         logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)
+        return True
+    from agent.fallback_rate_limit_sidecar import active_cooldown, log_cooldown_skip
+    sidecar_cooldown = active_cooldown(fb_provider, fb_model, _fallback_entry_base_url(agent, fb, fb_provider))
+    if sidecar_cooldown is not None:
+        # A durable per-(provider, model) bench from an earlier 429: the entry would
+        # fail the same way the primary just did, so skip it and let the walk reach a
+        # healthy model on the first try. See agent/fallback_rate_limit_sidecar.py.
+        log_cooldown_skip(fb_provider, fb_model, sidecar_cooldown)
         return True
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2031,6 +2092,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    _arm_entry_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)
