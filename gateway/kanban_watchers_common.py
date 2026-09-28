@@ -269,7 +269,7 @@ def _write_dispatcher_lease(handle, identity: dict) -> None:
 def _read_dispatcher_lease(lock_path) -> dict:
     """Read the owner lease record from the lock file. Never raises."""
     try:
-        with open(str(lock_path), "r", encoding="utf-8") as fh:
+        with open(str(lock_path), "r", encoding="utf-8-sig") as fh:
             data = fh.read()
         if not data.strip():
             return {}
@@ -394,8 +394,15 @@ def _dispatcher_takeover_challenge(lock_path, verdict: str, challenger: str) -> 
     """
     try:
         Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(str(lock_path), "r+", encoding="utf-8") as fh:
+        with open(str(lock_path), "r+", encoding="utf-8-sig") as fh:
             data = fh.read()
+            # One stream does both directions here: utf-8-sig makes the READ
+            # BOM-tolerant (a Windows editor may have touched the lock file),
+            # but on the WRITE side utf-8-sig EMITS a BOM — the exact bytes the
+            # read-side rule exists to tolerate. Repo policy is "reads
+            # utf-8-sig, writes utf-8 (never emit a BOM)", so switch the
+            # encoder back before rewriting the lease record.
+            fh.reconfigure(encoding="utf-8")
             record = {}
             if data.strip():
                 try:
