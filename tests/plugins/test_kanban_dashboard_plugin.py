@@ -27,8 +27,8 @@ from hermes_cli import kanban_db_connect as kbc
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return the module."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -40,7 +40,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
@@ -67,14 +72,51 @@ def test_board_empty(client):
     assert r.status_code == 200
     data = r.json()
     # All canonical columns present (triage + the rest), each empty.
+    # The dashboard renders one column per renderable status: exactly the
+    # plugin's own BOARD_COLUMNS contract (triage .. done). Two statuses in
+    # kb.VALID_STATUSES are deliberately absent here:
+    #   * `archived` — its own bucket, but only with ?include_archived=true;
+    #   * `trash`    — has no column of its own at all; trashed cards ride the
+    #                  archived bucket (see plugin_api.get_board / test_trash_rides_archived_column).
+    # So the expected set must NOT be derived from kb.VALID_STATUSES.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    assert names == _load_plugin_module().BOARD_COLUMNS
+    assert "trash" not in names, f"trash must not be a dashboard column: {names}"
+    assert "archived" not in names, f"archived is opt-in, not a default column: {names}"
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+def test_trash_rides_archived_column(client):
+    """`trash` is a dead-end bin with no column of its own (d9ce9086df).
+
+    Trashed cards hide from the default board exactly like archived ones and
+    surface in the `archived` column when it is requested, keeping their real
+    `status == "trash"` in the payload.
+    """
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "dead end"}).json()["task"]
+    with kbc.connect() as conn:
+        assert kb.trash_task(conn, t["id"], reason="blocked by an external constraint")
+        assert kb.get_task(conn, t["id"]).status == "trash"
+
+    # Default board: no `trash` column and no trashed card anywhere.
+    board = client.get("/api/plugins/kanban/board").json()
+    names = [c["name"] for c in board["columns"]]
+    assert "trash" not in names
+    assert t["id"] not in {x["id"] for c in board["columns"] for x in c["tasks"]}
+
+    # Opted-in archived column: the card rides it, status preserved.
+    board = client.get("/api/plugins/kanban/board", params={"include_archived": True}).json()
+    names = [c["name"] for c in board["columns"]]
+    assert "archived" in names
+    assert "trash" not in names
+    archived = next(c for c in board["columns"] if c["name"] == "archived")
+    cards = [x for x in archived["tasks"] if x["id"] == t["id"]]
+    assert len(cards) == 1, f"trashed card missing from archived column: {archived}"
+    assert cards[0]["status"] == "trash"
 
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
