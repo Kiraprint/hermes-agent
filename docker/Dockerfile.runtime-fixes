@@ -18,10 +18,14 @@
 #  3. hermes_cli/kanban_db.py: trashing a *running* card now terminates its
 #     worker (PR #30, merge 46593ada33) instead of only nulling worker_pid, which
 #     left an orphan process burning tokens against a card nothing tracks.
+#  4. hermes_cli/kanban_db_dispatch.py: worker argv carries -P so the harness
+#     never imports hermes from the task workspace (workers run with
+#     TERMINAL_CWD = a checkout of this repo, and the cwd wins for `-m`).
 ARG BASE=hermes-agent:merged-bff18e6ff0-gtk
 FROM ${BASE}
 COPY agent/agent_runtime_helpers.py /opt/hermes/agent/agent_runtime_helpers.py
 COPY hermes_cli/kanban_db.py /opt/hermes/hermes_cli/kanban_db.py
+COPY hermes_cli/kanban_db_dispatch.py /opt/hermes/hermes_cli/kanban_db_dispatch.py
 COPY vendor/pyyaml/yaml /tmp/pyyaml/yaml
 RUN set -eu; \
     installed=0; \

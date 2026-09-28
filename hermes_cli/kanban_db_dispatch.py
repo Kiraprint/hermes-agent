@@ -2509,8 +2509,20 @@ def _rotate_worker_log(
 
 def _module_hermes_argv() -> list[str]:
     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
+    console-script target — there is no top-level ``hermes`` package).
+
+    ``-P`` keeps the *current working directory* off ``sys.path``. Worker
+    processes run with ``TERMINAL_CWD`` set to their task workspace, which for
+    this family of tasks is a checkout of this very repository — sometimes a
+    stale one. Without ``-P`` the worker imports ``tools.*``/``agent.*`` from
+    that checkout instead of the deployed image (2026-09-28: a Sep-22 workspace
+    copy's ``tools/daemon_pool.py`` predated the Python-3.14 worker-context
+    branch, so every tool call died with ``'DaemonThreadPoolExecutor' object has
+    no attribute '_initializer'`` and the card crash-looped into an auto-block).
+    A flag, not ``PYTHONSAFEPATH``: children the worker spawns must keep the
+    normal cwd-importable semantics for repo scripts.
+    """
+    return [sys.executable, "-P", "-m", "hermes_cli.main"]
 
 
 def _absolute_hermes_path(path: str) -> str:
