@@ -2480,6 +2480,21 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     from difflib import get_close_matches
     if not tool_name:
         return None
+    # Models routinely emit shell-ish names for the terminal tool ("shell",
+    # "bash", "sh", "run_command", "run_shell", "run_terminal",
+    # "execute_command", "terminal_exec"). Map them to the canonical name so a
+    # turn never dies on an "Unknown tool" validation loop (t_58ff9db1 class):
+    # a kanban worker that called "shell" 3/3 was rejected before dispatch and
+    # exited 1, even with registry aliases registered, because turn validation
+    # gates on agent.valid_tool_names first.
+    _TERMINAL_ALIASES = frozenset((
+        "shell", "bash", "sh", "run_command", "run_shell",
+        "run_terminal", "execute_command", "terminal_exec",
+    ))
+    if (tool_name.lower() in _TERMINAL_ALIASES
+            and tool_name.lower() not in agent.valid_tool_names
+            and "terminal" in agent.valid_tool_names):
+        return "terminal"
     # VolcEngine api/plan leaks XML attribute fragments into tool_use.name (`terminal"
     # parameter="command" ...`); trim at the first quote/angle bracket. Do NOT split on whitespace:
     # "write file" must reach ``_norm`` -> ``write_file``.

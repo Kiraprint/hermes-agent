@@ -1,0 +1,18 @@
+# Derived image: runtime stabilisation layer over the deployed -gtk base.
+#
+#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.runtime-fixes \
+#       --build-arg BASE=hermes-agent:merged-bff18e6ff0-gtk \
+#       -t hermes-agent:merged-bff18e6ff0-gtk-runtimefix .
+#
+# Ships two fixes that cannot reach the runtime through the platform release
+# pipeline (it only covers /opt/data/scripts|plugins|tests|docs):
+#  1. agent/agent_runtime_helpers.py: bake the terminal-alias repair branch
+#     (models calling "shell"/"bash"/... were rejected 3/3 as unknown tools by
+#     turn validation in per-profile kanban workers -- t_58ff9db1 class).
+#  2. vendor/pyyaml: the sealed venv ships hermes_yaml but no `yaml` module,
+#     while runtime scripts and repo code legitimately `import yaml` and use the
+#     full PyYAML API (yaml.SafeDumper etc.).
+ARG BASE=hermes-agent:merged-bff18e6ff0-gtk
+FROM ${BASE}
+COPY agent/agent_runtime_helpers.py /opt/hermes/agent/agent_runtime_helpers.py
+COPY vendor/pyyaml/yaml /opt/hermes/.venv/lib/python3.14/site-packages/yaml

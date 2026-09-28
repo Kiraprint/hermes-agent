@@ -278,6 +278,14 @@ RUN python3 -m pm.build_env --source /opt/hermes --python /usr/local/bin/python3
     --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock \
     --extra azure-identity --extra matrix --extra google-chat
 
+# The sealed venv ships hermes_yaml (upstream vendoring) but no `yaml` module,
+# while runtime scripts and repo code legitimately `import yaml` (config-guard,
+# hh-agent core/*, hermes-agent utils.py exercised by factory kanban tasks).
+# Bake the pure-Python PyYAML 6.0.3 package (MIT, vendored under vendor/pyyaml)
+# so every interpreter in the image resolves the full public API (SafeDumper,
+# safe_dump, ...) instead of only hermes_yaml's safe subset.
+COPY vendor/pyyaml/yaml /opt/hermes/.venv/lib/python3.14/site-packages/yaml
+
 # Icons render on the runtime environment: Pillow and resvg-py are core
 # dependencies. A stage of its own so the frontend stage keeps building its
 # Node dependencies in parallel with the Python ones.
