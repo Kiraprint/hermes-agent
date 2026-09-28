@@ -186,6 +186,38 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         _try_cleanup_parent_workspaces(conn, task_id)
     except Exception:
         pass  # best-effort — never block completion
+    finally:
+        _sweep_launcher_leaks()
+
+
+def _sweep_launcher_leaks() -> None:
+    """Remove shared-bin entries pointing into kanban workspaces.
+
+    A worker boots Hermes from its own (ephemeral) workspace checkout, and boot
+    maintenance used to publish the PATH conveniences -- ``hermes``,
+    ``hermes-acp``, ``hermes-agent`` -- *from that checkout*, hard-coding a path
+    inside the workspace::
+
+        $HOME/.local/bin/hermes -> .../workspaces/t_7180bf50/.hermes/bin/hermes
+
+    The directory is deleted right here, so the shared entry dangles and breaks
+    ``hermes`` resolution for every later session that has that bin dir on PATH
+    (t_7180bf50, t_a1a9f616). ``hermes_cli._launchers`` refuses new ones
+    (fail-closed on an ephemeral install root); this is the teardown half, so a
+    task session cannot leave a shim behind even if it was created by a build
+    that predates the guard. Best-effort: cleanup must never block completion.
+    """
+    try:
+        from hermes_cli.launcher_leak_guard import scrub_shared_bin_leaks
+
+        removed = scrub_shared_bin_leaks().get("removed") or []
+        if removed:
+            _kb._log.warning(
+                "Swept %d launcher shim(s) pointing into kanban workspaces: %s",
+                len(removed), ", ".join(removed),
+            )
+    except Exception as exc:  # noqa: BLE001 - teardown never fails a task
+        _kb._log.debug("launcher leak sweep skipped: %s", exc)
 
 
 def _cleanup_worktree_workspace(

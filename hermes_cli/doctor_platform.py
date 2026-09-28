@@ -542,6 +542,16 @@ def _check_command_installation(should_fix: bool, f: Finding) -> None:
     termux = prefix and (os.environ.get("TERMUX_VERSION") or "com.termux/files/usr" in prefix)
     link_dir, display = (Path(prefix) / "bin", "$PREFIX/bin") if termux else (Path.home() / ".local" / "bin", "~/.local/bin")
     link = link_dir / "hermes"
+    from hermes_cli.launcher_leak_guard import is_ephemeral_root
+
+    if is_ephemeral_root(PROJECT_ROOT):
+        # A kanban worker runs Hermes from a workspace checkout that is deleted
+        # when the task completes. Claiming the shared command for it would
+        # dangle there and break `hermes` for every other session
+        # (t_c1c13fe0), so the durable owner keeps it.
+        check_warn(f"{display}/hermes left to its durable owner",
+                   f"({PROJECT_ROOT} is a task workspace)")
+        return
     if link.is_symlink():
         target, expected = link.resolve(), venv_bin.resolve()
         if target == expected:
