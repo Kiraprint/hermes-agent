@@ -1962,7 +1962,14 @@ def _end_run(
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
-    ``current_run_id``; None when no run was active (never-claimed task).
+    ``current_run_id``; None when the task had no run at all (never-claimed).
+
+    Every row still marked ``running`` is closed, not only the one
+    ``current_run_id`` points at: a run can outlive its pointer (crash between
+    the two writes below, a legacy row, a hand-repaired board) and that orphan
+    is exactly what the dispatcher reads as a live attempt. ``_reclaim_dangling_run``
+    covers the mirror case — a flapping status that is NOT terminal — from the
+    pointer side.
 
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
@@ -1970,24 +1977,33 @@ def _end_run(
     to end a worker that survived its own terminal transition."""
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
-    if run_id is None:
-        return None
-    conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_expires = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
-    )
+    final_status = status or outcome
+    stranded = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND status = 'running' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in stranded:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = COALESCE(outcome, ?),
+                   summary       = COALESCE(?, summary),
+                   error         = COALESCE(?, error),
+                   metadata      = COALESCE(?, metadata),
+                   ended_at      = COALESCE(ended_at, ?),
+                   claim_expires = NULL
+             WHERE id = ?
+            """,
+            (final_status, outcome, summary, error, _json_or_null(metadata), now, row["id"]),
+        )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if run_id is None and stranded:
+        # A stranded row IS this task's attempt history, so report it rather than
+        # None: a caller that would otherwise synthesize a zero-duration run
+        # (see :func:`_end_or_synthesize_run`) adopts the real row instead of
+        # duplicating it.
+        run_id = int(stranded[0]["id"])
     return run_id
 
 

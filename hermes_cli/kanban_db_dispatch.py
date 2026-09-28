@@ -548,7 +548,10 @@ def _terminate_reclaimed_worker(
         if not _sigkill(kill, pid):
             return info
         info["sigkill"] = True
-    info["terminated"] = not _worker_alive(pid, started_at)
+    # SIGKILL is asynchronous: give it the same grace poll the SIGTERM path gets
+    # before reporting the worker as surviving, so a termination that did land
+    # isn't recorded as ``terminated=False`` (which would read as "still alive").
+    info["terminated"] = _poll_worker_exit(pid, started_at)
     return info
 
 
