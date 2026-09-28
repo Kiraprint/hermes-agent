@@ -136,7 +136,9 @@ def _read_state() -> Dict[str, Any]:
     if path is None:
         return {}
     try:
-        raw = path.read_text(encoding="utf-8")
+        # utf-8-sig: a BOM written by Windows tooling (PowerShell Set-Content) would
+        # otherwise make json.loads fail and silently drop every armed cooldown.
+        raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return {}
     except OSError as exc:
