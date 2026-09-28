@@ -2008,3 +2008,61 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+
+def test_trash_running_task_terminates_worker(kanban_home, monkeypatch):
+    """``trash_task`` on a *running* task must actually signal its host-local
+    worker process, not just null ``worker_pid`` in the DB — the same defect
+    ``archive_task`` had (#76196): a trashed card is a dead end, yet its worker
+    kept running and could still push/complete work against a card the board
+    no longer tracks. The outcome is auditable via the
+    ``trash_worker_termination`` event."""
+    import json
+
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        # A verified spawn: an uncaptured fingerprint would (correctly) refuse the signal.
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot:1|777")
+        kbd._set_worker_pid(conn, t, 54321)
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        signalled = []
+        assert kb.trash_task(
+            conn, t, signal_fn=lambda pid, sig: signalled.append((pid, sig)),
+        ) is True
+
+        assert signalled and signalled[0][0] == 54321
+
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'trash_worker_termination'",
+            (t,),
+        ).fetchone()
+        payload = json.loads(row["payload"])
+        assert payload["prev_pid"] == 54321
+        assert payload["host_local"] is True
+        assert payload["termination_attempted"] is True
+        assert payload["terminated"] is True
+        assert kb.get_task(conn, t).status == "trash"
+
+
+def test_trash_non_running_task_does_not_attempt_termination(kanban_home):
+    """A never-claimed (``triage``/``ready``/``done``) task has no live worker:
+    ``trash_task`` must not signal anything, and no termination event is
+    recorded — only for tasks that were actually ``running`` at trash time."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        signalled = []
+        assert kb.trash_task(
+            conn, t, signal_fn=lambda pid, sig: signalled.append((pid, sig)),
+        ) is True
+        assert signalled == []
+        row = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'trash_worker_termination'",
+            (t,),
+        ).fetchone()
+        assert row is None

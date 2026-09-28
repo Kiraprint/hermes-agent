@@ -3951,6 +3951,7 @@ def trash_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
+    signal_fn=None,
 ) -> bool:
     """Move a task to the ``trash`` column: a terminal dead-end bin.
 
@@ -3963,11 +3964,31 @@ def trash_task(
 
     Unlike ``archived``, a trashed task does NOT satisfy its dependents: the
     work was never done, so children gated on it stay blocked.
+
+    A *running* task's host-local worker is terminated, for the same reason
+    :func:`archive_task` terminates its own: nulling ``worker_pid`` in the DB
+    alone leaves the OS process running against a card nothing tracks anymore.
+    Snapshot pid+claim+spawn fingerprint inside the txn so the kill is
+    contingent on THIS caller winning the trash transition; the kill itself
+    runs after commit because ``_poll_worker_exit`` can wait ~5 s and must not
+    hold the write lock. Post-release kill is safe because ``trash`` is a dead
+    end: the dispatcher only spawns ``ready``, so no duplicate worker can be
+    spawned off the released claim. The outcome lands as its own
+    ``trash_worker_termination`` event so the ``trashed`` event stays atomic
+    with the status flip.
     """
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return False
+        was_running = row["status"] == "running"
+        prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
         cur = conn.execute(
             "UPDATE tasks SET status = 'trash', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND status NOT IN ('trash', 'archived')",
             (task_id,),
         )
@@ -3985,6 +4006,10 @@ def trash_task(
             {"reason": reason} if reason else None,
             run_id=run_id,
         )
+    if was_running:
+        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+        with write_txn(conn):
+            _append_event(conn, task_id, "trash_worker_termination", termination, run_id=run_id)
     # The workspace is dead weight once the card is a dead end.
     _cleanup_workspace(conn, task_id)
     return True
