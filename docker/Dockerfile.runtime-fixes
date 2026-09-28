@@ -28,12 +28,29 @@
 #     "WARNING" to "[drift_skip:silent]" — the consumer suppresses a failed
 #     run's delivery when its error text contains the marker, so the generic
 #     word silently swallowed unrelated failures.
+#  7. Merged factory PRs #33/#34/#35 (main c083035e41c):
+#     - hermes_cli/kanban_db.py + kanban_db_dispatch.py: _end_run now closes every
+#       row still marked `running`, not only the one current_run_id points at, so an
+#       orphaned run can no longer be read as a live attempt (the phantom multi-hour
+#       rows a worker crash leaves behind).
+#     - gateway/kanban_watchers_common.py: dispatcher-lock reads are BOM-tolerant
+#       (utf-8-sig) while writes stay BOM-free — Windows tooling that touches the
+#       lock file no longer makes the lease unreadable.
+#     - agent/chat_completion_helpers.py + agent/turn_recovery.py + new
+#       agent/fallback_rate_limit_sidecar.py: a model the provider just rate-limited
+#       is skipped by the fallback walk instead of being re-selected immediately;
+#       cooldown state lives at $HERMES_HOME/.kanban_rate_limit.json (writable state,
+#       never the read-only release mounts).
 ARG BASE=hermes-agent:merged-bff18e6ff0-gtk
 FROM ${BASE}
 COPY agent/agent_runtime_helpers.py /opt/hermes/agent/agent_runtime_helpers.py
 COPY hermes_cli/kanban_db.py /opt/hermes/hermes_cli/kanban_db.py
 COPY hermes_cli/kanban_db_dispatch.py /opt/hermes/hermes_cli/kanban_db_dispatch.py
 COPY cron/scheduler.py /opt/hermes/cron/scheduler.py
+COPY gateway/kanban_watchers_common.py /opt/hermes/gateway/kanban_watchers_common.py
+COPY agent/chat_completion_helpers.py /opt/hermes/agent/chat_completion_helpers.py
+COPY agent/turn_recovery.py /opt/hermes/agent/turn_recovery.py
+COPY agent/fallback_rate_limit_sidecar.py /opt/hermes/agent/fallback_rate_limit_sidecar.py
 COPY vendor/pyyaml/yaml /tmp/pyyaml/yaml
 RUN set -eu; \
     installed=0; \
