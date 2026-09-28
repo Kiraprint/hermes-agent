@@ -126,7 +126,9 @@ def _hermes_home_is_test_sandbox(value: str) -> bool:
     if not sandbox:
         return False
     try:
-        return Path(value).expanduser().resolve() == Path(sandbox).expanduser().resolve()
+        return (
+            Path(value).expanduser().resolve() == Path(sandbox).expanduser().resolve()
+        )
     except Exception:
         return False
 
@@ -1482,7 +1484,9 @@ def _live_hermes_log_dirs() -> list[Path]:
         except Exception:
             pre = None
         sandbox = os.environ.get("HERMES_TEST_SANDBOX_HOME", "")
-        if pre is not None and not (sandbox and pre == Path(sandbox).expanduser().resolve()):
+        if pre is not None and not (
+            sandbox and pre == Path(sandbox).expanduser().resolve()
+        ):
             roots.append(pre)
 
     dirs: list[Path] = []

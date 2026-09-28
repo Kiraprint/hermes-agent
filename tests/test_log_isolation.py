@@ -78,6 +78,14 @@ def _all_file_destinations() -> list[str]:
 
 
 class TestLogIsolation:
+    # `allow_real_home_io`: the assertion below compares two *resolved* paths, and in
+    # the per-profile launcher shape (`HERMES_HOME=<root>/profiles/<name>`,
+    # `HOME=<profile>/home`) `~/.hermes` sits INSIDE the guarded pre-sandbox root.
+    # `resolve()` there is refused as I/O against that root before the comparison
+    # runs, so the guard would fail the test on its own bookkeeping rather than on
+    # the property it pins. The guard protects Hermes state; this test only reads
+    # two paths off the environment to compare them.
+    @pytest.mark.allow_real_home_io
     def test_hermes_home_is_sandboxed_before_imports(self):
         # Deliberately NOT os.environ: by test time the per-test `_isolate_env`
         # fixture has sandboxed HERMES_HOME, so reading it here would pass even
