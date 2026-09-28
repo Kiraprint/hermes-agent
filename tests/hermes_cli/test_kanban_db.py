@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -2160,3 +2161,262 @@ def test_trash_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+# ---------------------------------------------------------------------------
+# `hermes kanban trash <id>` against a LIVE worker process, and the
+# orphaned-run invariant on terminal status flips.
+#
+# The two defects found while cleaning the factory board (both reproduced
+# there with real rows):
+#   1. trash cleared ``worker_pid`` in the DB but left the worker's OS process
+#      running against a card the board no longer tracks;
+#   2. a run whose ``tasks.current_run_id`` pointer was lost before the flip
+#      stayed ``status='running'`` forever under a ``done``/``trash`` task.
+# ---------------------------------------------------------------------------
+
+ORPHAN_RUNS_SQL = (
+    "SELECT count(*) FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+    "WHERE r.status = 'running' AND t.status IN ('done', 'trash', 'archived')"
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# A real OS process standing in for a spawned worker: alive, signal-able, and
+# optionally deaf to SIGTERM so the escalation to SIGKILL is exercised too.
+_WORKER_SRC = """
+import os, signal, time
+if os.environ.get("KB_TEST_IGNORE_SIGTERM"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print("worker-ready", flush=True)
+while True:
+    time.sleep(0.2)
+"""
+
+
+def _claimed_worker(conn, pid: int) -> tuple[str, int]:
+    """A running card claimed host-locally with ``pid`` as its live worker.
+
+    ``kbd._set_worker_pid`` is the real registration path the dispatcher uses,
+    so the row carries the spawn fingerprint every liveness/kill decision
+    reads; the claim lock is this host's, which is what authorises the signal.
+    """
+    tid = kb.create_task(conn, title="live worker", assignee="a")
+    host = kb._claimer_id().split(":", 1)[0]
+    assert kb.claim_task(conn, tid, claimer=f"{host}:worker") is not None
+    kbd._set_worker_pid(conn, tid, pid)
+    return tid, kb._current_run_id(conn, tid)
+
+
+def _spawn_live_worker(*, ignore_sigterm: bool = False) -> subprocess.Popen:
+    """Start the stand-in worker and block until it is really running."""
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONUNBUFFERED": "1",
+        **({"KB_TEST_IGNORE_SIGTERM": "1"} if ignore_sigterm else {}),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _WORKER_SRC], env=env, text=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    )
+    ready = proc.stdout.readline().strip()  # "" once the process died instead
+    assert ready == "worker-ready", (ready, proc.returncode)
+    return proc
+
+
+def _kanban_cli(home: Path, *args: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
+    """Run the real ``hermes kanban`` CLI against THIS fixture's board.
+
+    Every inherited ``HERMES_*`` variable is dropped first: the worker running
+    this suite carries ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` pointing
+    at the production board, and those override ``HERMES_HOME`` — an unscrubbed
+    child would drive the live board instead of the fixture's.
+    ``HERMES_KANBAN_HOME`` then pins board resolution to this temp home; an id
+    that does not exist there makes the command fail loudly rather than touch
+    anything real.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
+    env.update({
+        "HOME": str(home.parent),
+        "HERMES_HOME": str(home),
+        "HERMES_KANBAN_HOME": str(home),
+        "PYTHONPATH": str(REPO_ROOT),
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+    })
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", *args],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, timeout=timeout,
+    )
+
+
+def _run_rows(conn, tid: str) -> list[dict]:
+    return [
+        {"status": r["status"], "outcome": r["outcome"], "ended_at": r["ended_at"]}
+        for r in conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ? ORDER BY id",
+            (tid,),
+        )
+    ]
+
+
+def _lose_run_pointer(conn, tid: str, *, partial_write: bool = False) -> None:
+    """Reproduce the live-board state that leaves a run ``running`` forever:
+    ``tasks.current_run_id`` is gone (crash / legacy row / partial write)
+    while the run row was never closed. ``partial_write`` also stamps
+    ``ended_at``/``outcome`` on the row — the ``status`` update never landed."""
+    if partial_write:
+        conn.execute(
+            "UPDATE task_runs SET outcome = 'completed', ended_at = ? WHERE task_id = ?",
+            (int(time.time()), tid),
+        )
+    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (tid,))
+    conn.commit()
+
+
+@pytest.mark.platforms("posix")  # asserts POSIX signal semantics (wait() == -SIGTERM)
+def test_trash_cli_kills_the_live_worker_process(kanban_home):
+    """The acceptance criterion: after ``hermes kanban trash <id>`` on a
+    running card the worker's OS PROCESS is gone — not just its DB row.
+
+    Drives the real CLI in a child process against the fixture board, with a
+    real (independently spawned) process registered as the worker through
+    ``kbd._set_worker_pid``, then reaps it: ``Popen.wait`` returns the signal
+    that ended it, so a DB-only "fix" cannot pass.
+    """
+    worker = _spawn_live_worker()
+    try:
+        with kbc.connect() as conn:
+            tid, _ = _claimed_worker(conn, worker.pid)
+            row = conn.execute(
+                "SELECT worker_pid, worker_started_at FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            assert row["worker_pid"] == worker.pid
+            assert kbd._worker_alive(worker.pid, row["worker_started_at"]) is True
+
+        trashed = _kanban_cli(kanban_home, "trash", tid)
+        assert trashed.returncode == 0, (trashed.stdout, trashed.stderr)
+        assert f"Trashed {tid}" in trashed.stdout
+
+        assert worker.wait(timeout=30) == -signal.SIGTERM
+        assert kbd._pid_alive(worker.pid) is False
+
+        with kbc.connect() as conn:
+            task = kb.get_task(conn, tid)
+            assert task.status == "trash"
+            assert task.worker_pid is None
+            assert [r for r in _run_rows(conn, tid) if r["status"] == "running"] == []
+            termination = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'trash_worker_termination'",
+                (tid,),
+            ).fetchone()
+            payload = json.loads(termination["payload"])
+            assert payload["prev_pid"] == worker.pid
+            assert payload["terminated"] is True
+            assert conn.execute(ORPHAN_RUNS_SQL).fetchone()[0] == 0
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=30)
+        worker.stdout.close()
+
+
+@pytest.mark.platforms("posix")  # SIGKILL escalation + wait() == -SIGKILL
+def test_trash_cli_escalates_to_sigkill_for_a_deaf_worker(kanban_home):
+    """A worker that ignores SIGTERM is still ended by ``hermes kanban trash``:
+    the grace poll expires and the escalation SIGKILLes it."""
+    worker = _spawn_live_worker(ignore_sigterm=True)
+    try:
+        with kbc.connect() as conn:
+            tid, _ = _claimed_worker(conn, worker.pid)
+
+        trashed = _kanban_cli(kanban_home, "trash", tid)
+        assert trashed.returncode == 0, (trashed.stdout, trashed.stderr)
+
+        assert worker.wait(timeout=30) == -signal.SIGKILL
+        assert kbd._pid_alive(worker.pid) is False
+
+        with kbc.connect() as conn:
+            payload = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'trash_worker_termination'",
+                (tid,),
+            ).fetchone()["payload"])
+            assert payload["prev_pid"] == worker.pid
+            assert payload["sigkill"] is True, payload
+            assert payload["terminated"] is True, payload
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=30)
+        worker.stdout.close()
+
+
+def test_complete_closes_the_active_run(kanban_home):
+    """Baseline for the orphaned-run invariant: a completion while a run is
+    active closes that run — no ``running`` row survives the ``done`` flip."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
+        assert [r["status"] for r in _run_rows(conn, tid)] == ["running"]
+
+        assert kb.complete_task(conn, tid, result="finished", force=True) is True
+
+        runs = _run_rows(conn, tid)
+        assert kb.get_task(conn, tid).status == "done"
+        assert [r["status"] for r in runs] == ["done"]
+        assert [r["outcome"] for r in runs] == ["completed"]
+        assert runs[0]["ended_at"] is not None
+        assert conn.execute(ORPHAN_RUNS_SQL).fetchone()[0] == 0
+
+
+def test_terminal_transition_closes_a_run_whose_pointer_was_lost(kanban_home):
+    """The orphaned-run defect: when ``tasks.current_run_id`` is gone but the
+    run row was never closed, a terminal flip (``done``/``trash``) must still
+    close that row instead of leaving it ``running`` forever — the state the
+    factory board was actually found in (2 such rows, 30+ days stale)."""
+    with kbc.connect() as conn:
+        done_tid = kb.create_task(conn, title="leaked then done", assignee="a")
+        assert kb.claim_task(conn, done_tid, claimer=kb._claimer_id()) is not None
+        _lose_run_pointer(conn, done_tid)
+
+        trash_tid = kb.create_task(conn, title="leaked then trashed", assignee="a")
+        assert kb.claim_task(conn, trash_tid, claimer=kb._claimer_id()) is not None
+        _lose_run_pointer(conn, trash_tid)
+
+        assert kb.complete_task(conn, done_tid, result="finished", force=True) is True
+        assert kb.trash_task(conn, trash_tid) is True
+
+        assert kb.get_task(conn, done_tid).status == "done"
+        assert kb.get_task(conn, trash_tid).status == "trash"
+        for tid in (done_tid, trash_tid):
+            runs = _run_rows(conn, tid)
+            # Exactly the leaked row, closed — not a second synthesized one.
+            assert len(runs) == 1, runs
+            assert runs[0]["status"] != "running", runs
+            assert runs[0]["ended_at"] is not None, runs
+        assert conn.execute(ORPHAN_RUNS_SQL).fetchone()[0] == 0
+
+
+def test_terminal_transition_closes_a_partially_written_run(kanban_home):
+    """Second shape of the same defect: the run row kept a stale ``running``
+    status while ``ended_at``/``outcome`` had already been written (the
+    pointer lost with them) — the flip must still normalise the row, without
+    rewriting the attempt evidence it already carries."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
+        _lose_run_pointer(conn, tid, partial_write=True)
+        stale = _run_rows(conn, tid)[0]
+        assert stale["status"] == "running" and stale["ended_at"] is not None
+
+        assert kb.complete_task(conn, tid, result="finished", force=True) is True
+
+        runs = _run_rows(conn, tid)
+        assert len(runs) == 1, runs
+        assert runs[0]["status"] == "done", runs
+        assert runs[0]["outcome"] == "completed", runs
+        assert runs[0]["ended_at"] == stale["ended_at"], runs
+        assert conn.execute(ORPHAN_RUNS_SQL).fetchone()[0] == 0
