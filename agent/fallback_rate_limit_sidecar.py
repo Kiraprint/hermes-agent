@@ -321,6 +321,11 @@ def is_rate_limit_error(message: str, status_code: Optional[int] = None,
 
     ``status_code`` is honoured when the caller has it, but a rendered message
     carrying ``429`` counts too: the retry loop's ``error_msg`` is a string by then.
+
+    The structured throttle codes win whatever status they ride on: the router
+    benches a model with a 503 (or a 400) whose body says ``free_rate_limited``,
+    and the bench has to follow the body rather than the status line. Free prose
+    ("rate limit" in a traceback) still needs a 429 behind it.
     """
     ctx = error_context or {}
     haystack = " ".join(
@@ -329,14 +334,14 @@ def is_rate_limit_error(message: str, status_code: Optional[int] = None,
     ).lower()
     code = " ".join(str(part) for part in (ctx.get("code"), ctx.get("reason")) if part).lower()
 
-    if status_code is not None and int(status_code) != 429:
-        return False
-    if status_code is None and "429" not in haystack:
-        return False
     if any(pattern in haystack for pattern in _FREE_TIER_PATTERNS):
         return True
     if any(code_name in code for code_name in _COOLDOWN_CODES):
         return True
+    if status_code is not None and int(status_code) != 429:
+        return False
+    if status_code is None and "429" not in haystack:
+        return False
     return "rate limit" in haystack or "rate_limit" in haystack or "too many requests" in haystack
 
 
@@ -356,15 +361,24 @@ def arm_cooldown(provider: str, model: str, seconds: float, *, base_url: str = "
     ttl = _clamp(float(seconds))
     state = _read_state()
     entries = _prune(state)
-    key = _entry_key(provider, model, base_url)
+    # Arm BOTH identities: the endpoint key (what actually got throttled) and the
+    # provider-label key. The skip side resolves base_url from the config and only
+    # falls back to the label key when that lookup succeeded — with an unresolvable
+    # base_url it asks for the label key, so a single endpoint-keyed write would
+    # never match and the walk would re-select the benched model.
+    keys = [_entry_key(provider, model, base_url)]
+    label_key = _entry_key(provider, model)
+    if label_key not in keys:
+        keys.append(label_key)
 
-    existing = entries.get(key)
-    if isinstance(existing, dict):
-        existing_remaining = _remaining_from_reset_at(existing.get("reset_at"))
-        if existing_remaining is not None and existing_remaining > ttl:
-            ttl = existing_remaining
+    for armed_key in keys:
+        existing = entries.get(armed_key)
+        if isinstance(existing, dict):
+            existing_remaining = _remaining_from_reset_at(existing.get("reset_at"))
+            if existing_remaining is not None and existing_remaining > ttl:
+                ttl = existing_remaining
 
-    entries[key] = {
+    entry = {
         "provider": provider,
         "model": model,
         "base_url": _normalize_base_url(base_url),
@@ -373,6 +387,8 @@ def arm_cooldown(provider: str, model: str, seconds: float, *, base_url: str = "
         "retry_after": ttl,
         "reason": reason,
     }
+    for armed_key in keys:
+        entries[armed_key] = dict(entry)
     if not _write_state(_trim(entries)):
         logger.warning("Rate-limit cooldown for %s/%s NOT persisted (sidecar unwritable)", provider, model)
         return None
@@ -436,13 +452,18 @@ def is_cooldown_active(provider: str, model: str, base_url: str = "") -> Tuple[b
 
 
 def log_cooldown_skip(provider: str, model: str, cooldown: Cooldown) -> str:
-    """Emit the skip log line carrying the cooldown timestamp; return it for tests."""
+    """Emit the skip log line carrying the cooldown timestamp; return it for tests.
+
+    Both stamps are UTC (``gmtime``): the clock read in a local-timezone host and
+    the offset printed next to it used to disagree, so the "until" stamp could not
+    be compared with the provider's own UTC reset hint.
+    """
     now = time.time()
-    reset_clock = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(cooldown.reset_at))
+    reset_clock = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(cooldown.reset_at))
     line = (
         f"Fallback skip: {provider}/{model} rate-limited (cooldown "
         f"{int(cooldown.remaining(now))}s left, {cooldown.percent(now)}% of {int(cooldown.retry_after)}s, "
-        f"until {reset_clock} UTC+{time.strftime('%z')[:3]})"
+        f"until {reset_clock} UTC{time.strftime('%z', time.gmtime(cooldown.reset_at))})"
     )
     logger.info(line)
     return line
@@ -452,6 +473,10 @@ def clear_cooldown(provider: str, model: str, base_url: str = "") -> None:
     """Drop a cooldown once the pair demonstrably works again."""
     state = _read_state()
     entries = _prune(state)
-    if entries.pop(_entry_key(provider, model, base_url), None) is not None:
+    # Arm wrote the endpoint AND the label key (see arm_cooldown); clearing one but
+    # not the other would leave a stale bench that still skips the entry.
+    removed = [key for key in (_entry_key(provider, model, base_url), _entry_key(provider, model))
+               if entries.pop(key, None) is not None]
+    if removed:
         _write_state(_trim(entries))
         logger.debug("Rate-limit cooldown cleared: %s/%s", provider, model)

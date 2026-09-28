@@ -1775,6 +1775,7 @@ def route_classified_error(
     from agent.conversation_compression import conversation_history_after_compression
     from agent.conversation_loop import _arm_fallback_restart, _ra
     from agent.model_metadata import estimate_request_tokens_rough
+    from agent.chat_completion_helpers import _arm_entry_rate_limit_cooldown
 
     _provider_overflow_recovery_pending = False
     is_rate_limited = False
@@ -1886,20 +1887,50 @@ def route_classified_error(
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)
     )
+    # Credential rotation may recover a 429 on its own (#11314): then rotation, not
+    # a bench, is the recovery path and no cooldown is armed below. Hoisted so the
+    # arming and the fallback decision read the SAME answer — previously arming
+    # lived inside the fallback branch, so a 429 with an empty chain (or with
+    # try_activate_fallback refusing) never reached the sidecar and the next turn
+    # re-selected the model that 429'd.
+    _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
+    _pool_may_recover = False
+    if _should_fallback:
+        _pool_may_recover = (
+            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(
+                getattr(agent, "_credential_pool", None)
+            )
+        )
+
+    # The durable per-entry cooldown (agent.fallback_rate_limit_sidecar) reads this
+    # error to decide whether the failure is rate-limit-shaped, so record the CURRENT
+    # one before any arming path can run — arming via the auth-failover branch below
+    # used to see a stale message from an earlier turn and fall back to the default
+    # window.
+    agent._last_api_error_message = str(error_msg)
+    agent._last_api_error_status = status_code
+    agent._last_api_error_context = error_context if isinstance(error_context, dict) else None
+
+    if _wrapped_output_cap_budget is None and not _pool_may_recover:
+        # Shapes try_activate_fallback never sees must still bench the model
+        # for the NEXT walk: a 503 carrying `free_rate_limited` classifies
+        # `overloaded`, so this turn walks nowhere while the router has already benched
+        # the model — without this the next turn (or the next process, after a restart)
+        # re-selects it. Same for a 429 whose fallback path declines (empty chain):
+        # arming used to live ONLY inside that branch, so the model was never benched
+        # when there was nowhere to fall back to. Excluded: the relay-wrapped
+        # output-cap 429 (a request-shape bug the max_tokens clamp fixes, not a
+        # throttle to bench over) and a pool that recovers by rotation (#11314).
+        reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+        _arm_entry_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at)
+
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an
         # upstream-aggregator 429 — the pool can't help, always fall back.
         # Fixes #11314.
-        _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
-        pool_may_recover = (
-            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
-        )
-        if not pool_may_recover:
+        if not _pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-            # The durable per-entry cooldown needs the provider's own reset hint; the
-            # fallback walk arms it (agent.fallback_rate_limit_sidecar).
-            agent._last_api_error_message = str(error_msg)
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
 

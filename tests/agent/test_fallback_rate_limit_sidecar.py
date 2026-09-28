@@ -162,3 +162,209 @@ class TestFailOpen:
 
     def test_empty_model_is_rejected_without_writing(self):
         assert sidecar.arm_cooldown("llm-router", "", 300.0, base_url=ROUTER) is None
+
+
+# ---------------------------------------------------------------------------
+# The production wiring: detector -> arming -> walk skip.
+#
+# The sidecar itself is unit-covered above; these tests pin the two ROUTES
+# that must reach it, because both were silent defects: the router threw the
+# original body away (ar msg_str has no ``status_code`` and no ``reset_at``),
+# and the walk never re-read the sidecar when config could not resolve the
+# candidate's base_url.
+# ---------------------------------------------------------------------------
+
+MODEL = "anymodel/ds/deepseek-v4-flash"
+SIBLING = "bai/mimo-v2.6-flash"
+
+# 503 + free_tier_body: the shape the classification layer throws as
+# ``overloaded`` (a reason try_activate_fallback never sees). Arming it is
+# the whole point of the detector, not just ``is_rate_limit_error``'s call
+# sites.
+FREE_503_MESSAGE = (
+    "Error code: 503 - {'error': {'message': 'free_rate_limited: no free quota "
+    "left for this endpoint', 'type': 'rate_limit_error', 'code': "
+    "'free_rate_limited', 'reset_seconds': 94}}"
+)
+# The same status WITHOUT a throttle body: an upstream outage is not a model
+# to bench, only a transport failure to retry.
+PLAIN_503_MESSAGE = "Error code: 503 - {'error': {'message': 'upstream overloaded'}}"
+# The request-shape cap: it arrives as a 429 but is excluded by the budget
+# check in route_classified_error (that one is why max_tokens is clamped).
+WRAPPED_429_MESSAGE = (
+    "Error code: 429 - {'error': {'message': '[400]: max_tokens (16384) exceeds "
+    "model maximum output tokens (8192)', 'type': 'invalid_request_error'}}"
+)
+AUTH_401_MESSAGE = (
+    "Error code: 401 - {'error': {'message': 'rate limit exceeded, check your "
+    "plan', 'type': 'authentication_error'}}"
+)
+
+
+class _APIError(Exception):
+    """The exception type the loop raises with ``status_code`` bolted on."""
+
+    status_code = None
+
+
+def _agent(message="", status=None, context=None):
+    """The narrow agent surface route_classified_error + the walk touch."""
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(
+        provider="llm-router",
+        model=MODEL,
+        base_url=ROUTER,
+        requested_provider="llm-router",
+        _primary_runtime={"provider": "llm-router", "model": MODEL, "base_url": ROUTER},
+        _fallback_activated=False,
+        _fallback_index=0,
+        _fallback_chain=[],
+        compression_enabled=True,
+        _last_api_error_message=message,
+        _last_api_error_status=status,
+        _last_api_error_context=context,
+    )
+    return agent
+
+
+def _route(agent, message, status, context=None):
+    """Run the real error router over ``message``; returns its verdict."""
+    from agent.error_classifier import classify_api_error
+    from agent.turn_recovery import route_classified_error
+    from agent.turn_retry_state import TurnRetryState
+
+    err = _APIError(message)
+    err.status_code = status
+    classified = classify_api_error(err, model=MODEL, provider="llm-router", base_url=ROUTER)
+    return route_classified_error(
+        agent,
+        err,
+        classified,
+        TurnRetryState(),
+        error_msg=message,
+        error_context=context or {},
+        recovered_with_pool=False,
+        base_url=ROUTER,
+        model=MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        api_messages=[{"role": "user", "content": "hi"}],
+        system_message=None,
+        active_system_prompt=None,
+        conversation_history=[],
+        retry_count=0,
+        max_retries=3,
+        compression_attempts=0,
+        max_compression_attempts=3,
+        api_call_count=1,
+        effective_task_id=None,
+    )
+
+
+class TestErrorRouterArmsTheSidecar:
+    """route_classified_error must bench the model for the NEXT walk too.
+
+    A free-tier 503 classifies as ``overloaded``, so try_activate_fallback
+    never runs on it; without the direct arm here every later turn re-selects
+    the benched model after a restart.
+    """
+
+    def test_503_free_rate_limited_benches_the_model(self):
+        agent = _agent()
+        verdict = _route(agent, FREE_503_MESSAGE, 503)
+        assert verdict.action == "fallthrough"
+        cooldown = sidecar.active_cooldown("llm-router", MODEL, ROUTER)
+        assert cooldown is not None
+        assert cooldown.reset_at > time.time()
+
+    def test_503_free_rate_limited_benches_under_both_keys(self):
+        _route(_agent(), FREE_503_MESSAGE, 503)
+        # The endpoint key (walk has no config) AND the provider/model label key.
+        assert sidecar.active_cooldown("llm-router", MODEL, ROUTER) is not None
+        assert sidecar.active_cooldown("llm-router", MODEL, "") is not None
+
+    def test_plain_503_overload_does_not_bench(self):
+        _route(_agent(), PLAIN_503_MESSAGE, 503)
+        assert sidecar.active_cooldown("llm-router", MODEL, ROUTER) is None
+
+    def test_401_prose_does_not_bench(self):
+        _route(_agent(), AUTH_401_MESSAGE, 401)
+        assert sidecar.active_cooldown("llm-router", MODEL, ROUTER) is None
+
+    def test_wrapped_output_cap_429_does_not_bench(self):
+        """The budget path (max_tokens clamp) is not a throttle: excluded."""
+        _route(_agent(), WRAPPED_429_MESSAGE, 429)
+        assert sidecar.active_cooldown("llm-router", MODEL, ROUTER) is None
+
+    def test_429_benches_without_a_reset_hint_in_context(self):
+        """reset_at lives in the body, not in error_context — still must arm."""
+        _route(_agent(), LIVE_429_MESSAGE, 429)
+        cooldown = sidecar.active_cooldown("llm-router", MODEL, ROUTER)
+        assert cooldown is not None
+        assert cooldown.reset_at > time.time()
+
+
+class TestWalkSkipsTheBenchedEntry:
+    """_should_skip_fallback_candidate must consult the sidecar ALWAYS.
+
+    Every case here runs a seeker whose OWN model differs from the benched one:
+    agent.backend_identity's "same backend" guard also skips an entry equal to
+    the current backend, so without that separation a pass could come from the
+    identity guard instead of from the sidecar — the exact reason the incident
+    review asked for proof, not for another model-name comparison.
+    """
+
+    def _walk(self, seeker, fb_model=MODEL):
+        from agent import chat_completion_helpers as helpers
+
+        fb = {"provider": "llm-router", "base_url": "", "model": fb_model}
+        fb_key = ("llm-router", fb_model)
+        return helpers._should_skip_fallback_candidate(seeker, fb, fb_key, "llm-router", fb_model, set())
+
+    @staticmethod
+    def _seeker():
+        """A walker running a healthy sibling, so identity cannot decide."""
+        seeker = _agent()
+        seeker.model = SIBLING
+        return seeker
+
+    @staticmethod
+    def _unresolvable(seeker):
+        """The walk's position during the incident: no config to resolve base_url."""
+        seeker.requested_provider = "someone-else"
+        seeker._primary_runtime = {}
+        return seeker
+
+    def test_unresolvable_base_url_still_skips_the_benched_model(self):
+        _route(_agent(), FREE_503_MESSAGE, 503)
+        seeker = self._unresolvable(self._seeker())
+        from agent import chat_completion_helpers as helpers
+
+        # The sidecar is then the ONLY signal that can name this entry: the
+        # config lookup yields nothing and identity compares different models.
+        assert helpers._fallback_entry_base_url(seeker, {"provider": "llm-router"}, "llm-router") == ""
+        assert self._walk(seeker) is True
+
+    def test_resolved_base_url_skips_through_the_endpoint_key(self):
+        _route(_agent(), FREE_503_MESSAGE, 503)
+        seeker = self._seeker()
+        # _fallback_entry_base_url resolves to the primary's endpoint here, so
+        # the walk hits the endpoint key the arming wrote.
+        from agent import chat_completion_helpers as helpers
+
+        assert helpers._fallback_entry_base_url(seeker, {"provider": "llm-router"}, "llm-router") == ROUTER
+        assert self._walk(seeker) is True
+
+    def test_a_sibling_is_not_skipped(self):
+        _route(_agent(), FREE_503_MESSAGE, 503)
+        # The primary's own model running, asking for a DIFFERENT entry: only
+        # the benched (provider, model) pair may be suppressed.
+        assert self._walk(_agent(), SIBLING) is False
+
+    def test_clearing_the_cooldown_re_admits_the_entry(self):
+        _route(_agent(), FREE_503_MESSAGE, 503)
+        sidecar.clear_cooldown("llm-router", MODEL, ROUTER)
+        sidecar.clear_cooldown("llm-router", MODEL, "")
+        assert sidecar.active_cooldown("llm-router", MODEL, ROUTER) is None
+        seeker = self._unresolvable(self._seeker())
+        assert self._walk(seeker) is False
