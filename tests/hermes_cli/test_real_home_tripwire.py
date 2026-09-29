@@ -202,3 +202,78 @@ def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
+
+
+def test_interpreter_symlink_alias_is_a_spelling_of_its_installation(tmp_path, monkeypatch):
+    """uv names a managed interpreter twice — ``cpython-3.14-linux-x86_64-gnu`` (symlink) and its
+    versioned target — and a venv's ``python`` points at the *symlink*, so
+    ``os.path.realpath(sys.executable)`` (sysconfig, linecache, traceback) lstats the alias. Under
+    ``HERMES_HOME=/opt/data`` that store sits inside the guarded root, and keying the exemption on
+    resolved paths alone made the guard refuse on its own interpreter (22 errors in this file)."""
+    from tests import home_io_guard
+
+    home = tmp_path / "home"
+    store = home / "python"
+    installed = store / "cpython-3.14.7-linux-x86_64-gnu"
+    executable = installed / "bin" / "python3.14"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    alias = store / "cpython-3.14-linux-x86_64-gnu"
+    alias.symlink_to(installed)
+    (store / "unrelated").mkdir()
+
+    spellings = home_io_guard._installation_spellings(installed)
+    assert alias in spellings and installed.resolve() in spellings
+    assert {spelling.resolve() for spelling in spellings} == {installed.resolve()}
+    assert store / "unrelated" not in spellings
+
+    monkeypatch.setattr(home_io_guard, "_INTERPRETER_PREFIXES", spellings)
+    guard = home_io_guard.HomeIOGuard(lambda: [home])
+    guard.check(alias, metadata=True)
+    guard.check(alias / "bin" / "python3.14", metadata=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(store / "unrelated")  # an alias may not widen into a sibling installation
+
+
+def test_payload_manifest_beside_the_checkout_is_not_hermes_state(tmp_path, monkeypatch):
+    """``pm.environments.payload_venv`` / ``store_root`` probe ``<checkout>/../manifest.json`` while
+    ``hermes_bootstrap`` imports: the document describes the install layout of the tree next to it,
+    so it is install metadata rather than user state. Nothing else in that directory is exempt."""
+    from tests import home_io_guard
+
+    home = tmp_path / "home"
+    checkout = home / "hermes-agent"
+    checkout.mkdir(parents=True)
+    monkeypatch.setattr(home_io_guard, "_CHECKOUT_PARENTS", frozenset({checkout.parent}))
+
+    guard = home_io_guard.HomeIOGuard(lambda: [home])
+    guard.check(checkout.parent / "manifest.json")
+    guard.check(checkout.parent / "manifest.json", metadata=True)
+    for refused in (checkout.parent / "config.yaml", home / "state" / "manifest.json"):
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            guard.check(refused)
+
+
+def test_linked_worktree_git_dir_is_not_hermes_state(tmp_path, monkeypatch):
+    """A linked worktree (how every factory task is checked out) keeps its git dir in the shared
+    clone instead of in the tree. With the clone under the guarded root that git dir is outside the
+    exempt checkout, and the launch path probes ``<git dir>/hermes-update-pull`` on every import
+    (``hermes_cli._early_recovery.interrupted_pull_marker``)."""
+    from tests import home_io_guard
+
+    home = tmp_path / "home"
+    clone = home / "repos" / "hermes-agent"
+    worktree = home / "workspaces" / "task-wt"
+    git_dir = clone / ".git" / "worktrees" / "task-wt"
+    git_dir.mkdir(parents=True)
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    assert home_io_guard._linked_git_dir(worktree) == git_dir.resolve()
+
+    monkeypatch.setattr(home_io_guard, "_CHECKOUT_GIT_DIRS", frozenset({git_dir.resolve()}))
+    guard = home_io_guard.HomeIOGuard(lambda: [home])
+    guard.check(git_dir / "hermes-update-pull", metadata=True)
+    guard.check(git_dir.parent, metadata=True)  # realpath() walking up to the git dir
+    guard.check(git_dir / "hermes-update-pull")
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(clone / "config.yaml")

@@ -11,19 +11,106 @@ import sqlite3
 import sys
 import threading
 
-_INTERPRETER_PREFIXES = tuple({
-    Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
-} | {
+
+def _installation_spellings(leaf: Path) -> frozenset[Path]:
+    """Every lexical name under which the interpreter installation *leaf* is reachable.
+
+    ``uv`` keeps an interpreter under two names — ``cpython-3.14-linux-x86_64-gnu`` (an
+    unversioned symlink) and ``cpython-3.14.7-linux-x86_64-gnu`` (its target) — and the
+    venv's ``python`` points at the *symlink*: ``sys.executable`` therefore walks the
+    alias, so ``os.path.realpath(sys.executable)`` (``sysconfig``, ``linecache``,
+    ``traceback``) lstats the alias directory. Its lexical name is not
+    ``is_relative_to`` the resolved prefix, so keying the exemption on resolved paths
+    alone made the guard refuse on its own interpreter under ``HERMES_HOME=/opt/data``.
+
+    Resolving the candidate at check time is not an option — deciding "this is not
+    Hermes state" must never probe the protected tree — so the aliases are collected
+    here, at import time, before the guard is armed: at most one bounded listing of the
+    installation's parent directory. A symlink only counts as a spelling of *leaf* when
+    it really resolves to it, so the set can never widen into a sibling or a parent.
+    """
+    spellings = {leaf}
+    try:
+        resolved = leaf.resolve(strict=True)
+    except OSError:  # vanished installation: the lexical name is all we know
+        return frozenset(spellings)
+    spellings.add(resolved)
+    for parent in {leaf.parent, resolved.parent}:
+        try:
+            siblings = list(parent.iterdir())
+        except OSError:
+            continue
+        for sibling in siblings:
+            if sibling in spellings or not sibling.is_symlink():
+                continue
+            try:
+                if sibling.resolve(strict=True) == resolved:
+                    spellings.add(sibling)
+            except OSError:
+                continue  # broken link or symlink loop: not a spelling of this install
+    return frozenset(spellings)
+
+
+def _interpreter_prefixes() -> frozenset[Path]:
+    """Lexical spellings of the running interpreter's installations."""
+    spellings: set[Path] = set()
+    for leaf in {Path(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix) if p}:
+        spellings |= _installation_spellings(leaf)
+    return frozenset(spellings)
+
+
+_CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+
+_INTERPRETER_PREFIXES = _interpreter_prefixes() | frozenset({
     # A PM-activated developer shell runs sys.prefix's python against a dependency generation
     # whose site-packages sits under the (real) Hermes home; third-party imports from it are the
     # interpreter's installation, not Hermes state.
     Path(p).resolve() for p in sys.path if p and Path(p).name in ("site-packages", "dist-packages")
-} | {
+}) | frozenset({
     # The default install checks the repo out INSIDE the home (install.sh:
     # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
-    Path(__file__).resolve().parent.parent,
+    _CHECKOUT_ROOT,
+})
+
+# A sealed payload describes itself in a manifest NEXT TO the tree (install.sh writes
+# ``$INSTALL_ROOT/manifest.json`` naming ``repo``/``venv``), and ``pm.environments.payload_venv``
+# / ``store_root`` probe exactly ``<checkout>/../manifest.json`` while ``hermes_bootstrap``
+# imports. That document belongs to the install layout, like the checkout it describes — it is
+# install metadata, not user state — so the directory that holds the checkout may hand over its
+# manifest and nothing else. Recorded as the holding directory rather than the file path so the
+# exemption still matches when the checkout is reached through a symlinked home.
+_CHECKOUT_PARENTS = frozenset({_CHECKOUT_ROOT.parent})
+
+
+def _linked_git_dir(checkout: Path) -> Path | None:
+    """``checkout``'s git dir when git keeps it OUTSIDE the working tree.
+
+    A linked worktree (``git worktree add``, which is how every factory task is checked out)
+    replaces ``.git`` with a file pointing at the shared repository's
+    ``.git/worktrees/<name>``. When that clone lives under a guarded root — the factory's
+    ``/opt/data/repos/hermes-agent`` — the pointer resolves outside the exempt checkout, and
+    the launch path probes ``<git dir>/hermes-update-pull`` there on every CLI import
+    (``hermes_cli._early_recovery.interrupted_pull_marker``). A git dir holds VCS tooling
+    state, exactly what a standalone clone keeps inside its own exempt tree; it is not
+    Hermes state either way.
+    """
+    dot_git = checkout / ".git"
+    try:
+        if not dot_git.is_file():
+            return None
+        text = dot_git.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    target = Path(text[len("gitdir:"):].strip())
+    return (target if target.is_absolute() else checkout / target).resolve()
+
+
+_CHECKOUT_GIT_DIRS = frozenset({
+    git_dir for git_dir in (_linked_git_dir(_CHECKOUT_ROOT),) if git_dir is not None
 })
 
 
@@ -75,6 +162,18 @@ class HomeIOGuard:
             # realpath() walking up through its ancestors.
             if any(absolute.is_relative_to(prefix) or (metadata and prefix.is_relative_to(absolute))
                    for prefix in _INTERPRETER_PREFIXES):
+                return
+            # The payload manifest that sits beside the checkout (see _CHECKOUT_PARENTS): the
+            # bootstrap probes ``<checkout>/../manifest.json`` on every CLI import, and reading
+            # install metadata there tells the caller nothing about Hermes state.
+            if absolute.name == "manifest.json" and absolute.parent in _CHECKOUT_PARENTS:
+                return
+            # VCS tooling of the checkout itself: a linked worktree's git dir sits outside the
+            # tree, and the launch path probes its interrupted-update marker (see
+            # _linked_git_dir). Ancestors are exempt only for metadata calls, so realpath()
+            # walking up to the git dir is not mistaken for a state read.
+            if any(absolute.is_relative_to(git_dir) or (metadata and git_dir.is_relative_to(absolute))
+                   for git_dir in _CHECKOUT_GIT_DIRS):
                 return
             # Check the lexical path first: resolving must not probe a protected
             # tree merely to decide that the original path was forbidden.
