@@ -12,6 +12,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
     cache_image_from_bytes,
+    escape_chunk_indicator,
     safe_url_for_log,
     utf16_len,
     _prefix_within_utf16_limit,
@@ -1623,3 +1624,45 @@ class TestPlatformLockTakeoverGovernance:
         assert adapter._acquire_platform_lock("discord-token", "tok", "Discord") is False
         assert len(takeover_calls) == 1
         assert adapter._platform_lock_takeover_attempted is True
+
+
+class TestEscapeChunkIndicator:
+    """``truncate_message`` appends its " (i/N)" marker *after* the caller formatted the body, so on
+    a MarkdownV2 send the parentheses it adds are the only unescaped ones — Telegram rejects the
+    chunk ("character '(' is reserved and must be escaped") and the sender drops to plain text."""
+
+    @staticmethod
+    def _mdv2(text):
+        from plugins.platforms.telegram.adapter import _escape_mdv2
+        return _escape_mdv2(text)
+
+    def test_body_is_untouched_and_only_the_marker_is_escaped(self):
+        assert escape_chunk_indicator("**bold** (2/40)", self._mdv2) == r"**bold** \(2/40\)"
+        # Idempotent: the edit path formats before it splits, so the marker can arrive escaped.
+        assert escape_chunk_indicator(r"body \(2/40\)", self._mdv2) == r"body \(2/40\)"
+        assert escape_chunk_indicator("x (12345/12345)", self._mdv2) == r"x \(12345/12345\)"
+        # Nothing appended (every single-chunk send) and non-escaping modes stay byte-identical.
+        assert escape_chunk_indicator("plain body") == "plain body"
+        assert escape_chunk_indicator("plain (1/3)") == "plain (1/3)"
+
+    def test_indicator_moves_off_a_synthesized_closing_fence(self):
+        # truncate_message closes an orphaned fence; Telegram rejects a fence line that also
+        # carries the marker, so the marker gets its own line.
+        assert escape_chunk_indicator("code\n``` (1/2)", self._mdv2) == "code\n```\n\\(1/2\\)"
+        assert escape_chunk_indicator("code\n``` (1/2)") == "code\n```\n(1/2)"
+
+    def test_every_chunk_of_a_split_message_gets_an_escaped_marker(self):
+        """Chunk 1..N all carry the marker, so all of them have to survive the parser."""
+        from plugins.platforms.telegram.adapter import _strip_mdv2
+
+        content = ("line with (parens) and *stars* and .dots\n" * 200).strip()
+        chunks = BasePlatformAdapter.truncate_message(content, 300, len_fn=utf16_len)
+        assert len(chunks) > 1
+        for i, chunk in enumerate(chunks, start=1):
+            marker, raw_marker = f" \\({i}/{len(chunks)}\\)", f" ({i}/{len(chunks)})"
+            text = escape_chunk_indicator(chunk, self._mdv2)
+            assert text.endswith(marker) and text.count(marker) == 1
+            # Only the marker changed, and the reader still sees " (i/N)" once escapes are stripped
+            # (that is the text the plain-text fallback sends).
+            assert text[: -len(marker)] == chunk[: -len(raw_marker)]
+            assert _strip_mdv2(text).endswith(raw_marker)

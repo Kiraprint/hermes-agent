@@ -144,6 +144,19 @@ def _strip_mdv2_safe(text):
         return text
 
 
+def _escape_mdv2_safe(text):
+    """MarkdownV2-escape the appended chunk indicator; identity if the formatter is unavailable.
+
+    ``_telegram_format`` escapes the *body* before ``truncate_message`` appends `` (i/N)``, so the
+    raw parenthesis is rejected by Telegram and every chunk after the first drops to plain text.
+    """
+    try:
+        from plugins.platforms.telegram.adapter import _escape_mdv2
+        return _escape_mdv2(text)
+    except Exception:
+        return text
+
+
 def _adapter_media_method(ext, voice, force_document=False):
     """``(adapter method, kind)``: document when forced, else image / video / voice by
     extension (``voice`` already folds in the caller's audio rule)."""
@@ -262,7 +275,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
-        from gateway.platforms.base import BasePlatformAdapter, utf16_len
+        from gateway.platforms.base import BasePlatformAdapter, utf16_len, escape_chunk_indicator
         # Telegram accepts a numeric chat_id OR an @username string; never force-int.
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
@@ -277,7 +290,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
+        # The appended " (i/N)" marker is the one part truncate_message adds to the escaped body, so
+        # MarkdownV2 sends escape it too — otherwise every chunk dies on "character '(' is reserved".
+        _indicator_escaper = None if _has_html else _escape_mdv2_safe
         for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
+            chunk = escape_chunk_indicator(chunk, _indicator_escaper)
             last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
