@@ -411,6 +411,17 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
     from pm.paths import install_root
 
     root = Path(project_root or install_root()).resolve()
+    from hermes_cli.launcher_leak_guard import is_ephemeral_root
+
+    if is_ephemeral_root(root):
+        # A worker checkout is deleted together with its task workspace, so any
+        # PATH entry pointing at it dangles the moment the task completes and
+        # breaks `hermes` for every later session (t_7180bf50 published
+        # $HOME/.local/bin/{hermes,hermes-acp,hermes-agent} into
+        # .../kanban/workspaces/t_7180bf50/.hermes/bin/). Fail closed on every
+        # platform: a task checkout keeps its own launchers and is refused
+        # ownership of anything outside the workspace.
+        return {"ok": True, "skipped": "ephemeral-root"}
     if _is_windows():
         # The installer stages the user-facing commands into $HERMES_HOME\bin
         # and registers that directory in the User PATH. An update skipped both
@@ -429,14 +440,33 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
             return {"ok": True, "skipped": "config-disabled"}
     from hermes_cli.steward import read_install_stamp
 
+    from hermes_cli.launcher_leak_guard import scrub_shared_bin_leaks
+
+    # Every publication also sweeps what an earlier build leaked into the
+    # shared bin dirs; the sweep only removes entries that point into a
+    # kanban-managed workspace (see hermes_cli.launcher_leak_guard).
+    import logging
+
+    scrubbed: list[str] = []
+    try:
+        scrubbed = list(scrub_shared_bin_leaks().get("removed", []))
+    except Exception as exc:  # noqa: BLE001 - a sweep must never break a boot
+        logging.getLogger(__name__).debug("launcher leak sweep skipped: %s", exc)
+
+    def _result(**extra: object) -> dict:
+        out: dict = {"ok": True, **extra}
+        if scrubbed:
+            out["scrubbed"] = scrubbed
+        return out
+
     if _is_bundled_payload(root):
         if create and sys.platform == "darwin":
             return _symlink_sealed_launchers(root.parent / "bin")
-        return {"ok": True, "skipped": "bundle-owns-launchers"}
+        return _result(skipped="bundle-owns-launchers")
     if read_install_stamp(root).get("updateMechanism") == "external":
-        return {"ok": True, "skipped": "externally-owned"}
+        return _result(skipped="externally-owned")
     if resolve_store_python(root) is None:
-        return {"ok": True, "skipped": "no-store-python"}
+        return _result(skipped="no-store-python")
     try:
         local = root / ".hermes" / "bin"
         if len(ensure_install_launchers(root, local)) != len(WINDOWS_BIN_LAUNCHERS):
@@ -452,7 +482,7 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         for directory in dirs:
             published = _publish_conveniences(root, directory, (*WINDOWS_BIN_LAUNCHERS, "hermes-agent"), create=create)
             written.extend(path.name for path, changed in published.items() if changed)
-        return {"ok": True, "written": written}
+        return _result(written=written)
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
 
