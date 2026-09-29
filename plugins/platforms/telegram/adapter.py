@@ -143,6 +143,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+    escape_chunk_indicator,
 )
 
 # Every refused button tap answers with the same sentence.
@@ -358,15 +359,6 @@ def _strip_mdv2(text: str) -> str:
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
     return cleaned
-
-
-_CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
-
-
-def _separate_chunk_indicator_from_fence(text: str) -> str:
-    """Move a ``(N/M)`` chunk marker that ``truncate_message()`` appended to a synthesized closing
-    fence onto its own line — Telegram rejects ````` \\(1/2\\)`` as a fence."""
-    return _CHUNK_INDICATOR_ON_FENCE_RE.sub(r'```\n\g<indicator>', text)
 
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
@@ -3764,11 +3756,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     return rich_result
             chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
-                chunks = [
-                    _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
-                    for chunk in chunks
-               ]
+                # truncate_message appends a raw " (1/2)" suffix to an already-formatted body:
+                # escape the MarkdownV2-reserved parentheses (own line off a synthesized fence).
+                chunks = [escape_chunk_indicator(chunk, _escape_mdv2) for chunk in chunks]
             return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
@@ -4057,7 +4047,7 @@ class TelegramAdapter(BasePlatformAdapter):
         for use_markdown in (True, False) if finalize else (False,):
             try:
                 if use_markdown:
-                    text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
+                    text = escape_chunk_indicator(self.format_message(chunk), _escape_mdv2)
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
                     text = _strip_mdv2(chunk) if finalize else chunk
@@ -4100,7 +4090,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if finalize:
                 await self._edit_markdown_or_plain(
-                    chat_id, message_id, _separate_chunk_indicator_from_fence(self.format_message(first_chunk)), _strip_mdv2(first_chunk),
+                    chat_id, message_id, escape_chunk_indicator(self.format_message(first_chunk), _escape_mdv2), _strip_mdv2(first_chunk),
                     "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s")
             else:
                 await self._edit_text(chat_id, message_id, first_chunk)
