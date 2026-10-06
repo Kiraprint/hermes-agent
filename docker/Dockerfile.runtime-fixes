@@ -41,6 +41,15 @@
 #       is skipped by the fallback walk instead of being re-selected immediately;
 #       cooldown state lives at $HERMES_HOME/.kanban_rate_limit.json (writable state,
 #       never the read-only release mounts).
+#  7. agent/kanban_stop.py + agent/prompt_builder.py: the kanban worker
+#     terminal-tool protocol was too weak — a worker could end its session with a
+#     plain-text message and no terminal board call, recorded as a "protocol
+#     violation (clean exit with the card still running)", burning retries and
+#     redoing the work. The stop-nudge budget is raised (2 -> 4) and KANBAN_GUIDANCE
+#     now carries an explicit MANDATORY terminal-action section ("your final
+#     response MUST be a kanban_complete / kanban_request_review /
+#     kanban_request_changes / kanban_block tool call; a plain-text ending is a
+#     protocol violation").
 ARG BASE=hermes-agent:merged-bff18e6ff0-gtk
 FROM ${BASE}
 COPY agent/agent_runtime_helpers.py /opt/hermes/agent/agent_runtime_helpers.py
@@ -51,6 +60,8 @@ COPY gateway/kanban_watchers_common.py /opt/hermes/gateway/kanban_watchers_commo
 COPY agent/chat_completion_helpers.py /opt/hermes/agent/chat_completion_helpers.py
 COPY agent/turn_recovery.py /opt/hermes/agent/turn_recovery.py
 COPY agent/fallback_rate_limit_sidecar.py /opt/hermes/agent/fallback_rate_limit_sidecar.py
+COPY agent/kanban_stop.py /opt/hermes/agent/kanban_stop.py
+COPY agent/prompt_builder.py /opt/hermes/agent/prompt_builder.py
 COPY vendor/pyyaml/yaml /tmp/pyyaml/yaml
 RUN set -eu; \
     installed=0; \

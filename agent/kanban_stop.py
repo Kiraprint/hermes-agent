@@ -26,7 +26,7 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
     "kanban_request_changes",
 })
 
-_DEFAULT_MAX_ATTEMPTS = 2
+_DEFAULT_MAX_ATTEMPTS = 4
 
 
 def kanban_stop_nudge_enabled() -> bool:

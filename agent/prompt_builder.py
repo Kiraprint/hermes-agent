@@ -341,7 +341,19 @@ KANBAN_GUIDANCE = (
     "input.\n"
     "- Do not assign follow-up work to yourself. Assign it to the right specialist profile.\n"
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is for short reasoning subtasks inside your "
-    "own run; board tasks are for cross-agent handoffs that outlive one API loop."
+    "own run; board tasks are for cross-agent handoffs that outlive one API loop.\n"
+    "- Do NOT end your run with a plain-text message. A summary, a plan, an analysis or a status note is NOT a valid "
+    "ending — the board records it as a protocol violation, discards the run, and re-queues the card to be redone "
+    "from scratch.\n"
+    "\n"
+    "## Terminal action (MANDATORY)\n\n"
+    "Your **final response** MUST be a tool call to exactly one terminal board tool:\n"
+    "- `kanban_complete(summary=..., artifacts=[...])` — the deliverable is done and needs no review;\n"
+    "- `kanban_request_review(summary=...)` — a code change that needs same-card review;\n"
+    "- `kanban_request_changes(reason=...)` — you are the reviewer sending work back; or\n"
+    "- `kanban_block(reason=...)` — you cannot proceed (missing credential, ambiguous spec, external dependency).\n\n"
+    "Make the terminal board call the **last tool call you emit**. If the work is not finished, either keep working "
+    "or `kanban_block(reason=...)` — never stop with text only."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
