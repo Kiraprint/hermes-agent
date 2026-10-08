@@ -55,7 +55,7 @@ KNOWN_STATUSES = frozenset({HEALTHY, DEGRADED, UNHEALTHY, UNKNOWN})
 # Bounded reason vocabulary — never a free-form string (it is exported as an attribute).
 KNOWN_REASONS = frozenset({
     "clean_sync", "stale_sync", "conflict_escalated", "conflict_unattended",
-    "push_failed", "run_failed", "no_state", "reader_error",
+    "conflict_resolved_awaiting_run", "push_failed", "run_failed", "no_state", "reader_error",
 })
 # ``clean`` / ``conflict`` / ``push_failed`` / ``error`` / ``unknown``.
 KNOWN_RESULTS = frozenset({"clean", "conflict", "push_failed", "error", "unknown"})
@@ -69,6 +69,15 @@ _OPEN_ESCALATION_SQL = (
     "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'archived') "
     "AND (idempotency_key LIKE ? OR title LIKE ?)"
 )
+# Escalation prefix present but no OPEN one left: the conflict was escalated and
+# resolved (the tasked is done/archived) — the runner just needs a clean resync
+# to clear it, which is NOT "unattended".
+_RESOLVED_ESCALATION_SQL = (
+    "SELECT COUNT(*) FROM tasks WHERE status IN ('done', 'archived') "
+    "AND (idempotency_key LIKE ? OR title LIKE ?) "
+    "AND idempotency_key LIKE ?"
+)
+_RESOLVED_KEY = f"{_ESCALATION_KEY_PREFIX}%"
 
 _LINE_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\]")
 _RESULT_RE = re.compile(r"\bRESULT\s+(clean sync|created task|push failed|error)\b")
@@ -110,6 +119,7 @@ class ForkSyncState:
     last_run_age_seconds: Optional[float] = None
     last_success_age_seconds: Optional[float] = None
     escalation_open: int = 0
+    escalation_resolved: int = 0
     board_read_failed: bool = False
 
     @property
@@ -126,6 +136,7 @@ class ForkSyncState:
             "last_run_age_seconds": self.last_run_age_seconds,
             "last_success_age_seconds": self.last_success_age_seconds,
             "escalation_open": self.escalation_open,
+            "escalation_resolved": self.escalation_resolved,
             "board_read_failed": self.board_read_failed,
         }
 
@@ -336,12 +347,37 @@ def count_open_escalation_tasks(
         ).fetchone()
     return max(0, int(row[0] or 0)) if row else 0
 
+def count_resolved_escalation_tasks(
+    board: Optional[str] = None, *, db_path: Optional[Path] = None,
+) -> int:
+    """Read-only count of CLOSED (done/archived) fork-sync conflict-escalation tasks.
+
+    A conflict that was escalated and then resolved is "owned by a human who
+    already looked at it" — degraded pending a clean resync — rather than
+    "unattended".  Same bounded, mode=ro, fail-open-on-missing contract as
+    :func:`count_open_escalation_tasks`.
+    """
+    if db_path is None:
+        from hermes_cli.kanban_db import kanban_db_path
+        db_path = Path(kanban_db_path(board))
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return 0
+    with closing(sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=1.0)) as conn:
+        conn.execute("PRAGMA query_only = ON")
+        row = conn.execute(
+            _RESOLVED_ESCALATION_SQL,
+            (f"{_ESCALATION_KEY_PREFIX}%", f"{_ESCALATION_TITLE_PREFIX}%", _RESOLVED_KEY),
+        ).fetchone()
+    return max(0, int(row[0] or 0)) if row else 0
+
 
 def classify_fork_sync_state(
-    scan: _LogScan, *, escalation_open: int = 0, board_read_failed: bool = False,
+    scan: _LogScan, *, escalation_open: int = 0, escalation_resolved: int = 0,
+    board_read_failed: bool = False,
     stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS, now: Optional[float] = None,
 ) -> ForkSyncState:
-    """Project one log scan (+ the board's escalation count) into a status."""
+    """Project one log scan (+ the board's escalation counts) into a status."""
     now = time.time() if now is None else now
     run_age = None if scan.last_run_at is None else max(0.0, now - scan.last_run_at)
     success_age = None if scan.last_success_at is None else max(0.0, now - scan.last_success_at)
@@ -352,6 +388,7 @@ def classify_fork_sync_state(
             last_exit_code=scan.last_exit_code, last_run_at=scan.last_run_at,
             last_success_at=scan.last_success_at, last_run_age_seconds=run_age,
             last_success_age_seconds=success_age, escalation_open=max(0, int(escalation_open)),
+            escalation_resolved=max(0, int(escalation_resolved)),
             board_read_failed=bool(board_read_failed),
         )
 
@@ -365,9 +402,12 @@ def classify_fork_sync_state(
         return build(HEALTHY, "clean_sync")
     if scan.last_result == "conflict":
         # A conflict leaves the fork diverged.  It is degraded (owned) while the
-        # escalation task is open, unhealthy once nobody is looking at it.
+        # escalation task is open, degraded-but-awaiting-a-clean-resync once it
+        # was escalated and closed, unhealthy only when nobody ever looked.
         if board_read_failed or escalation_open > 0:
             return build(DEGRADED, "conflict_escalated")
+        if escalation_resolved > 0:
+            return build(DEGRADED, "conflict_resolved_awaiting_run")
         return build(UNHEALTHY, "conflict_unattended")
     if scan.last_result == "push_failed":
         return build(UNHEALTHY, "push_failed")
@@ -389,22 +429,26 @@ def read_fork_sync_state(settings: Optional[ForkSyncSettings] = None, *, now: Op
         logger.debug("fork-sync health: log read traceback", exc_info=True)
 
     escalation_open = 0
+    escalation_resolved = 0
     board_read_failed = False
     try:
         escalation_open = count_open_escalation_tasks(settings.board)
+        escalation_resolved = count_resolved_escalation_tasks(settings.board)
     except Exception as exc:
         board_read_failed = True
         logger.warning("fork-sync health: board read failed (error_type=%s)", type(exc).__name__)
         logger.debug("fork-sync health: board read traceback", exc_info=True)
 
     state = classify_fork_sync_state(
-        scan, escalation_open=escalation_open, board_read_failed=board_read_failed,
+        scan, escalation_open=escalation_open, escalation_resolved=escalation_resolved,
+        board_read_failed=board_read_failed,
         stale_after_seconds=settings.stale_after_seconds, now=now,
     )
     if log_error is not None and not scan.has_state:
         return ForkSyncState(
             status=UNKNOWN, reason="reader_error", last_result="unknown",
-            escalation_open=state.escalation_open, board_read_failed=board_read_failed,
+            escalation_open=state.escalation_open, escalation_resolved=state.escalation_resolved,
+            board_read_failed=board_read_failed,
         )
     return state
 

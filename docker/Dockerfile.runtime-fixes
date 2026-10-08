@@ -73,6 +73,7 @@ COPY agent/kanban_stop.py /opt/hermes/agent/kanban_stop.py
 COPY agent/prompt_builder.py /opt/hermes/agent/prompt_builder.py
 COPY agent/tool_call_leak_recovery.py /opt/hermes/agent/tool_call_leak_recovery.py
 COPY agent/turn_response_intake.py /opt/hermes/agent/turn_response_intake.py
+COPY agent/monitoring/fork_sync_health.py /opt/hermes/agent/monitoring/fork_sync_health.py
 COPY vendor/pyyaml/yaml /tmp/pyyaml/yaml
 RUN set -eu; \
     installed=0; \

@@ -57,22 +57,27 @@ def _clean_cache():
 
 @pytest.fixture()
 def no_board(monkeypatch):
-    """Keep the escalation probe off the ambient board unless a test wants it."""
+    """Keep both escalation probes off the ambient board unless a test wants it."""
     monkeypatch.setattr(fsh, "count_open_escalation_tasks", lambda board=None, **kw: 0)
+    monkeypatch.setattr(fsh, "count_resolved_escalation_tasks", lambda board=None, **kw: 0)
 
 
 def _board_reader(db_path):
-    """Point the escalation probe at a fixture DB (never at the ambient board).
+    """Point both escalation probes at a fixture DB (never at the ambient board).
 
-    The real function is captured first: ``fsh.count_open_escalation_tasks`` is
-    the monkeypatched attribute, so calling it from the replacement recurses.
+    The real functions are captured first: ``fsh.count_*_escalation_tasks`` are
+    the monkeypatched attributes, so calling them from the replacement recurses.
     """
-    real = fsh.count_open_escalation_tasks
+    open_real = fsh.count_open_escalation_tasks
+    resolved_real = fsh.count_resolved_escalation_tasks
 
     def _read(board=None, **kwargs):
-        return real(board, db_path=db_path)
+        return open_real(board, db_path=db_path)
 
-    return _read
+    def _resolved(board=None, **kwargs):
+        return resolved_real(board, db_path=db_path)
+
+    return _read, _resolved
 
 
 def _read(tmp_path, log_path, **kwargs) -> fsh.ForkSyncState:
@@ -146,7 +151,9 @@ def test_conflict_with_open_escalation_is_degraded(tmp_path, monkeypatch):
     db_path = _board_db(tmp_path, [
         ("t_ab12cd", "Fork-sync конфликт: hermes_cli/kanban_db.py", "blocked", "fork-sync-conflict-abc"),
     ])
-    monkeypatch.setattr(fsh, "count_open_escalation_tasks", _board_reader(db_path))
+    open_reader, resolved_reader = _board_reader(db_path)
+    monkeypatch.setattr(fsh, "count_open_escalation_tasks", open_reader)
+    monkeypatch.setattr(fsh, "count_resolved_escalation_tasks", resolved_reader)
 
     state = _read(tmp_path, log)
 
@@ -157,20 +164,41 @@ def test_conflict_with_open_escalation_is_degraded(tmp_path, monkeypatch):
     assert state.last_exit_code == 2
 
 
-def test_conflict_without_open_escalation_is_unhealthy(tmp_path, monkeypatch):
-    """A conflict whose escalation task is already closed is nobody's work: unhealthy."""
+def test_conflict_with_closed_escalation_is_degraded_awaiting_run(tmp_path, monkeypatch):
+    """A conflict whose escalation task is done was owned and is awaiting resync: degraded."""
     log = _write_log(tmp_path, "RESULT created task t_ab12cd (conflict escalated; rc=2)")
     db_path = _board_db(tmp_path, [
         ("t_ab12cd", "Fork-sync конфликт: old", "done", "fork-sync-conflict-abc"),
         ("t_ffff99", "Unrelated task", "ready", "some-other-key"),
     ])
-    monkeypatch.setattr(fsh, "count_open_escalation_tasks", _board_reader(db_path))
+    open_reader, resolved_reader = _board_reader(db_path)
+    monkeypatch.setattr(fsh, "count_open_escalation_tasks", open_reader)
+    monkeypatch.setattr(fsh, "count_resolved_escalation_tasks", resolved_reader)
+
+    state = _read(tmp_path, log)
+
+    assert state.status == fsh.DEGRADED
+    assert state.reason == "conflict_resolved_awaiting_run"
+    assert state.escalation_open == 0
+    assert state.escalation_resolved == 1
+
+
+def test_conflict_without_any_escalation_is_unhealthy(tmp_path, monkeypatch):
+    """A conflict nobody ever escalated is unattended: unhealthy."""
+    log = _write_log(tmp_path, "RESULT created task t_ab12cd (conflict escalated; rc=2)")
+    db_path = _board_db(tmp_path, [
+        ("t_ffff99", "Unrelated task", "ready", "some-other-key"),
+    ])
+    open_reader, resolved_reader = _board_reader(db_path)
+    monkeypatch.setattr(fsh, "count_open_escalation_tasks", open_reader)
+    monkeypatch.setattr(fsh, "count_resolved_escalation_tasks", resolved_reader)
 
     state = _read(tmp_path, log)
 
     assert state.status == fsh.UNHEALTHY
     assert state.reason == "conflict_unattended"
     assert state.escalation_open == 0
+    assert state.escalation_resolved == 0
 
 
 def test_legacy_runner_lines_are_recognised(tmp_path, no_board):
@@ -235,6 +263,7 @@ def test_raising_board_reader_is_contained(tmp_path, monkeypatch):
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(fsh, "count_open_escalation_tasks", _boom)
+    monkeypatch.setattr(fsh, "count_resolved_escalation_tasks", _boom)
 
     state = _read(tmp_path, log)
 
@@ -287,7 +316,9 @@ def test_metrics_are_content_free(tmp_path, monkeypatch):
         "RESULT created task t_ab12cd (conflict escalated: 2 files in /opt/data/x; rc=2)",
     )
     db_path = _board_db(tmp_path, [("t_ab12cd", "Fork-sync конфликт: x", "blocked", "k")])
-    monkeypatch.setattr(fsh, "count_open_escalation_tasks", _board_reader(db_path))
+    open_reader, resolved_reader = _board_reader(db_path)
+    monkeypatch.setattr(fsh, "count_open_escalation_tasks", open_reader)
+    monkeypatch.setattr(fsh, "count_resolved_escalation_tasks", resolved_reader)
 
     snapshot = _snapshot(tmp_path, log)
     blob = " ".join(
