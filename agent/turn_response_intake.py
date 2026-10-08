@@ -135,6 +135,31 @@ def normalize_model_response(
     if assistant_message.content is not None and not isinstance(assistant_message.content, str):
         assistant_message.content = _coerce_content_text(assistant_message.content)
 
+    # DeepSeek text-mode tool-call fall-through recovery (#1244/#1678): deepseek-v4-flash
+    # intermittently emits a tool invocation as <invoke>/DSML XML markup inside content with
+    # finish_reason="stop" and no structured tool_calls. Parse it back into tool_calls so the
+    # loop executes the call instead of storing the markup as the final answer (this was the
+    # pr-reviewer cron failure mode). Prose false-positives are guarded inside the module.
+    if not getattr(assistant_message, "tool_calls", None):
+        try:
+            from agent.tool_call_leak_recovery import (
+                build_message_tool_calls, recover_leaked_tool_calls,
+            )
+            _calls, _cleaned = recover_leaked_tool_calls(
+                assistant_message.content,
+                valid_names=getattr(agent, "valid_tool_names", None),
+            )
+            if _calls:
+                assistant_message.tool_calls = build_message_tool_calls(_calls)
+                assistant_message.content = _cleaned
+                assistant_message.finish_reason = "tool_calls"
+                finish_reason = "tool_calls"
+        except Exception:
+            try:
+                logger.exception("tool-call leak recovery failed")
+            except Exception:
+                pass
+
     # Agent-as-provider projection: splice the provider-agent's own tool work in as
     # call/result rows before this turn's assistant message; no-op for ordinary providers.
     splice_provider_projection(agent, response, messages)

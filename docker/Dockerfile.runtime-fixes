@@ -50,6 +50,15 @@
 #     response MUST be a kanban_complete / kanban_request_review /
 #     kanban_request_changes / kanban_block tool call; a plain-text ending is a
 #     protocol violation").
+#  8. agent/tool_call_leak_recovery.py + agent/turn_response_intake.py:
+#     DeepSeek chat models (deepseek-v4-flash / v4-pro) intermittently "fall
+#     through" to text mode and emit a tool invocation as literal
+#     <invoke>/DSML XML markup inside message.content with finish_reason="stop"
+#     and tool_calls=null (deepseek-ai/DeepSeek-V3#1244, #1678). Hermes only
+#     executes structured tool_calls, so the invocation was stored as the final
+#     answer and the tool never ran (this was the pr-reviewer cron failure mode,
+#     and murders any deepseek-backed agent that "decides" to hand-write a call).
+#     turn_response_intake now parses the leaked markup back into tool_calls.
 ARG BASE=hermes-agent:merged-bff18e6ff0-gtk
 FROM ${BASE}
 COPY agent/agent_runtime_helpers.py /opt/hermes/agent/agent_runtime_helpers.py
@@ -62,6 +71,8 @@ COPY agent/turn_recovery.py /opt/hermes/agent/turn_recovery.py
 COPY agent/fallback_rate_limit_sidecar.py /opt/hermes/agent/fallback_rate_limit_sidecar.py
 COPY agent/kanban_stop.py /opt/hermes/agent/kanban_stop.py
 COPY agent/prompt_builder.py /opt/hermes/agent/prompt_builder.py
+COPY agent/tool_call_leak_recovery.py /opt/hermes/agent/tool_call_leak_recovery.py
+COPY agent/turn_response_intake.py /opt/hermes/agent/turn_response_intake.py
 COPY vendor/pyyaml/yaml /tmp/pyyaml/yaml
 RUN set -eu; \
     installed=0; \
