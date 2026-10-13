@@ -203,6 +203,36 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+def test_create_idempotency_skips_trashed_task(kanban_home):
+    """A trashed task with the same idempotency key must not be returned as
+    "already created".
+
+    The idempotency lookup previously only excluded ``archived``; a task that
+    had been moved to ``trash`` (a deliberate dead end, distinct from archive)
+    was wrongly treated as existing, so ``create(idempotency_key=...)`` kept
+    returning the trashed card. With the fix, create falls through and makes a
+    fresh non-trash task. A *live* (non-trash, non-archived) task with the same
+    key is still deduped — no regression for normal idempotent creates.
+    """
+    with kbc.connect() as conn:
+        key = "test-idempotency-trash-af533cef"
+        # Normal idempotent create: second call dedupes onto the existing card.
+        t_live = kb.create_task(conn, title="live", assignee="a", idempotency_key=key)
+        t_again = kb.create_task(conn, title="live-again", assignee="a", idempotency_key=key)
+        assert t_again == t_live
+        assert kb.get_task(conn, t_again).status not in ("archived", "trash")
+
+        # Move the card to trash, then create again with the same key: the
+        # trashed card must NOT satisfy the idempotency check, so a fresh
+        # non-trash task is created instead of resurrecting the dead end.
+        assert kb.trash_task(conn, t_live, reason="test dead end") is True
+        assert kb.get_task(conn, t_live).status == "trash"
+
+        t_new = kb.create_task(conn, title="fresh", assignee="a", idempotency_key=key)
+        assert t_new != t_live
+        assert kb.get_task(conn, t_new).status != "trash"
+
+
 
 
 
