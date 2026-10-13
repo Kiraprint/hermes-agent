@@ -243,6 +243,40 @@ def _prefix_within_utf16_limit(s: str, limit: int) -> str:
     return s[:_custom_unit_to_cp(s, limit, utf16_len)]
 
 
+# The ``(i/N)`` continuation marker ``BasePlatformAdapter.truncate_message`` appends. The parens may
+# already carry a MarkdownV2 backslash (a sender that formats before chunking escapes them itself).
+_CHUNK_INDICATOR_RE = re.compile(r" (?:\\)?\((\d+)/(\d+)(?:\\)?\)$")
+
+
+def escape_chunk_indicator(text: str, escape_fn: Optional["Callable[[str], str]"] = None) -> str:
+    """Make the trailing ``(i/N)`` chunk indicator safe for the parse mode *text* is sent with.
+
+    ``truncate_message()`` appends the indicator **after** the caller formatted the body, so on a
+    MarkdownV2 send the one pair of raw parentheses it adds is the only thing Telegram rejects:
+    ``Can't parse entities: character '(' is reserved and must be escaped``. Every chunk after the
+    first then drops to plain text — one warning per chunk on every long digest (cron/hourly path).
+
+    ``escape_fn`` is the sender's own escaper (Telegram: ``_escape_mdv2``), applied to the marker
+    only, so the already-escaped body is never touched and a pre-escaped marker is not escaped
+    twice; ``_strip_mdv2`` restores the readable `` (1/2)`` in the plain-text fallback. Without
+    ``escape_fn`` the marker is emitted raw, i.e. byte-identical to today's output for senders where
+    ``(`` is not special (HTML, platform default) — and in both cases an indicator glued to a
+    synthesized closing fence moves onto its own line, because Telegram rejects ```` ``` (1/2) ````.
+
+    Text without a trailing indicator — the single-chunk case, most sends — is returned unchanged.
+    """
+    match = _CHUNK_INDICATOR_RE.search(text)
+    if match is None:
+        return text
+    marker = f"({match.group(1)}/{match.group(2)})"
+    if escape_fn is not None:
+        marker = escape_fn(marker)
+    body = text[: match.start()]
+    if body.rstrip().endswith("```"):  # synthesized fence close: the indicator needs its own line
+        return f"{body.rstrip()}\n{marker}"
+    return f"{body} {marker}"
+
+
 def is_network_accessible(host: str) -> bool:
     """True if *host* would expose the server beyond loopback (incl. IPv4-mapped
     ::ffff:127.0.0.1); hostnames are resolved and DNS failure fails closed (True)."""
@@ -4708,7 +4742,11 @@ class BasePlatformAdapter(ABC):
                          len_fn: Optional["Callable[[str], int]"] = None) -> List[str]:
         """Split a long message into chunks preserving code blocks: a split inside a fence closes it
         at the chunk end and reopens it (same language tag) in the next; multi-chunk output gets
-        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram)."""
+        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram).
+
+        The indicator is appended **raw**, i.e. after the caller formatted the text: a sender using
+        an escaping parse mode (Telegram MarkdownV2) must pass each chunk through
+        ``escape_chunk_indicator()`` or Telegram rejects the trailing ``(`` — see that helper."""
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]

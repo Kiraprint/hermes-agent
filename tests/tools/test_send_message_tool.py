@@ -238,6 +238,32 @@ def _make_config():
     ), telegram_cfg
 
 
+def _unescaped_parens_outside_code(text):
+    """Offsets of `(`/`)` that Telegram's MarkdownV2 parser rejects: unescaped and outside code.
+
+    Mirrors the parser's rule the failure message quotes (``character '(' is reserved and must be
+    escaped with the preceding '\\'``); backslash-escaped chars, ``` fences and `code spans` are
+    skipped. Used to fake the API's rejection locally, so a chunk that would have been answered with
+    a parse error can never be mistaken for a successful send.
+    """
+    offsets, in_fence, in_code, i = [], False, False, 0
+    while i < len(text):
+        if text.startswith("```", i):
+            in_fence = not in_fence
+            i += 3
+            continue
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`" and not in_fence:
+            in_code = not in_code
+        elif ch in "()" and not (in_fence or in_code):
+            offsets.append(i)
+        i += 1
+    return offsets
+
+
 def _install_telegram_mock(monkeypatch, bot):
     parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
     constants_mod = SimpleNamespace(ParseMode=parse_mode)
@@ -623,6 +649,62 @@ class TestSendToPlatformChunking:
         assert bot.send_message.await_count >= 2
         assert max(send_lengths) <= 4096
 
+
+
+    def test_telegram_chunk_indicator_is_escaped_in_markdownv2(self, monkeypatch, caplog):
+        """Every chunk of a MarkdownV2 send escapes the " (i/N)" marker ``truncate_message`` adds.
+
+        Regression: the marker is appended *after* ``format_message()`` escaped the body, so the
+        parentheses it adds are the only unescaped ones and Telegram answers "can't parse entities:
+        character '(' is reserved and must be escaped". Each chunk then fell back to plain text —
+        one warning per chunk, 39 of them on a 40-chunk hourly digest.
+        """
+        import logging
+
+        from gateway.platforms.base import utf16_len
+        from plugins.platforms.telegram.adapter import _strip_mdv2
+
+        sent = []
+
+        async def fake_send_message(**kwargs):
+            text = kwargs["text"]
+            bad = _unescaped_parens_outside_code(text)  # what Telegram's parser rejects
+            if bad:
+                raise Exception(
+                    "Bad Request: can't parse entities: Character '(' is reserved and must be "
+                    f"escaped with the preceding '\\' at byte offset {bad[0]}")
+            sent.append(text)
+            return SimpleNamespace(message_id=len(sent))
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(side_effect=fake_send_message)
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        with caplog.at_level(logging.WARNING, logger="tools.send_message_senders"):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.TELEGRAM,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "123",
+                    # MarkdownV2 escapes ! . - ( ) , so the payload inflates past 4096 several times.
+                    "**tokens** 133,276,365 (thr 11,617,290) - t_2327ebf0 done!\n" * 400,
+                )
+            )
+
+        assert result["success"] is True
+        assert len(sent) >= 3
+        assert all(utf16_len(text) <= 4096 for text in sent)
+        # Nothing was rejected, so no chunk hit the plain-text fallback.
+        assert "falling back to plain text" not in caplog.text
+        for i, text in enumerate(sent, start=1):
+            assert text.endswith(f" \\({i}/{len(sent)}\\)"), text[-30:]
+            # The marker stayed readable for clients that strip the escapes (plain-text fallback).
+            assert _strip_mdv2(text).endswith(f" ({i}/{len(sent)})")
 
 
 class TestMatrixMediaLiveAdapterReuse:
